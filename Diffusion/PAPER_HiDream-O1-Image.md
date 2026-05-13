@@ -62,7 +62,7 @@
 
 ## 🎯 논문 요약 (TL;DR)
 
-**한 줄 요약**: VAE도, 별도 텍스트 인코더도 없이 **raw pixel + text + condition**을 단일 공유 토큰 공간에서 처리하는 **decoder-only Unified Transformer**로 T2I/편집/IP를 모두 통합한 8B 모델이며, 2048×2048 native 합성·SOTA급 텍스트 렌더링·Artificial Analysis Arena #8 달성.
+**한 줄 요약**: 기존 VLM(**Qwen3-VL-8B-Instruct**) 가중치로 backbone을 초기화한 뒤 patch/timestep embedder와 final layer만 덧붙여 **diffusion 형태**로 확장한 구조 — VAE도, 별도 텍스트 인코더도 없이 **raw pixel + text + condition**을 단일 공유 토큰 공간에서 처리하는 **decoder-only Unified Transformer**로 T2I/편집/IP를 모두 통합한 8B 모델이며, 2048×2048 native 합성·SOTA급 텍스트 렌더링·Artificial Analysis Arena #8 달성.
 
 **핵심 문제**:
 1. 기존 LDM(SD3/FLUX/Qwen-Image)은 VAE compression으로 고주파 디테일을 잃고, 별도 text encoder(CLIP/T5)와 semantic misalign됨.
