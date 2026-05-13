@@ -172,21 +172,52 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 
 ### 3-5. 추론 코드 흐름 (공개 코드 기준)
 
-**Level 0 — 파이프라인**
+**Level 0 — 한눈에 보기: "1 prompt → 1 image"**
+
 ```
-prompt str ─▶ Qwen3-4B  (text_encoder)
-                 │  cap_feats [seq, 2560]
-torch.randn ─┐   │
-             │   ▼
-             └─▶ S3-DiT 30+4 layers   (transformer.py) ⏎ 8회 (Turbo)
-                 │  → velocity                          (Flow Matching Euler)
-                 ▼
-            (CFG truncation / normalization)
-                 │
-                 ▼ 8 step 후
-            Flux VAE.decode (fp32)                      (autoencoder.py)
-                 ▼
-            PIL.Image (1024×1024)
+  "Young Chinese woman in red Hanfu..."   ← 문자열 1개
+            │
+            ├─[A] Qwen3-4B  (512 tokens × 2560 hidden)
+            │
+            ↓
+    cap_feats (S, 2560) ──────────────────────────┐
+                                                   │
+                                                   │
+  torch.randn → latents (B, 16, 128, 128) fp32    │
+                              │                    │
+                              │                    │
+                              ↓                    ↓
+              ┌──── 8 steps (Turbo) ──────────────────────┐
+              │                                            │
+              │   latent + t  ┐                            │
+              │               │                            │
+              │  ┌────────────┴──────────┬─────────────┐   │
+              │  │  S3-DiT (6.15B)        │             │   │
+              │  │   ↑ Noise Refiner ×2   │             │   │
+              │  │   ↑ Context Refiner ×2 │ ← cap_feats │   │
+              │  │   ↑ Backbone ×30       │             │   │
+              │  │   ↑ Final Layer        │             │   │
+              │  └─────────────┬──────────┴─────────────┘   │
+              │                ↓                            │
+              │           velocity (B, 16, 128, 128)        │
+              │                │                            │
+              │                ↓ CFG trunc / norm           │
+              │                ↓                            │
+              │      scheduler.step (Flow Match Euler)      │
+              │      latent ← latent + dt · v               │
+              │                                             │
+              └────────────────┬────────────────────────────┘
+                               │
+                               ↓
+                   latents (B, 16, 128, 128) fp32
+                               │
+                               ↓ Flux VAE.decode (fp32)
+                               │
+                   image (B, 3, 1024, 1024) ∈ [-1, 1]
+                               │
+                               ↓ /2+0.5 → clamp → uint8
+                               │
+                   PIL.Image (1024×1024 RGB)
 ```
 
 **Level 1 — `generate()` substeps** ([pipeline.py:66](src/zimage/pipeline.py#L66))
