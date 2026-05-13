@@ -141,7 +141,54 @@ Attention (RoPE → QK-Norm) → FusedMVSplitNorm1 → SwiGLU FFN → FusedMVSpl
 - hidden 1024, 8 heads × 128 dims
 - 기본 코드 config: depth 100, width 1280, heads 10 (스몰)
 
-### 3-6. 코드에서 논문 기여의 위치 (⭐ vs ⚪)
+### 3-6. 코드 전체 흐름 (Prompt → Image)
+
+**Level 0 — 파이프라인 한눈에**
+```
+"a cat..."  ──▶  Qwen3 text encoder         (text_encoder.py)
+                       │  text_emb [B, L_t, D_t]
+Noise z_T   ──┐        │
+              │        ▼
+              └──▶  DiT 1000 blocks         (dit.py)   ⏎ 35회 반복
+                       │  → v_θ                        (Flow Matching Euler)
+                       ▼
+                 CFG: v = v_unc + s·(v_cond − v_unc)
+                 z ← z + Δt · v
+                       │
+                       ▼ (35 step 후)
+                  FLUX.2 VAE decode          (vae.py)
+                       │
+                       ▼
+                  RGB image (PNG)
+```
+
+**Level 1 — sample.py 진입 순서** ([sample.py](https://github.com/erwold/mv-split/blob/main/sample.py))
+1. `load_flux2_ae()` → `Qwen3TextEncoder()` → `DiT()` + checkpoint 로드 (L232–243)
+2. `select_jobs()` 프롬프트 선택 (L280)
+3. `text_encoder.encode()` 조건 + 무조건 embedding (L296)
+4. `randn(bs, 128, H/16, W/16)` 노이즈 초기화 (L298)
+5. `perform_multi_step_sampling()` 35-step Euler + CFG (L301–322)
+6. `vae.decode()` → PNG 저장 (L323–329)
+
+**Level 2 — DiT.forward 시퀀스** ([dit.py:451–505](https://github.com/erwold/mv-split/blob/main/dit.py))
+```
+z [B, 128, h/16, w/16]
+  → patch_embed + norm_img_input        → x_img [B, L_img, D]
+text_emb → context_proj                 → text_ctx [B, L_t, D]
+concat([x_img, text_ctx], dim=1)        → x [B, L_img+L_t, D]
+build RoPE (image 2D / text identity)
+for block in self.blocks:               (1000회)
+    x = block(x, rope, L_img)           ← DiTBlock (구조는 → 3-4)
+x[:, :L_img] → final_proj → unpatchify  → v_θ [B, 128, h/16, w/16]
+```
+
+**Level 3 — Triton 커널 2-pass backward** ([kernels/fused_mvsplit_rmsnorm.py](https://github.com/erwold/mv-split/blob/main/kernels/fused_mvsplit_rmsnorm.py))
+- Forward: 토큰별로 segment(`l < L_img`) 판별 → seg별 `mu_x, mu_u` 로드 → 수식 (→ 3-2) → RMSNorm
+- Pass A: 시퀀스를 CHUNK_L(16~128)로 청크화, seg별 `Σ dY`, `Σ dY·u` 누적 → partial_sums
+- Pass B: partial_sums 합산 → seg별 `mean_dY` → 토큰별 `dX = dY − α·mean_dY`, `dU = β·dY + (α−β)·mean_dY` 기록
+- **2-pass인 이유**: mean이 시퀀스 전체를 봐야 해 청크 간 동기화가 필요. Pass A에서 부분합 → Pass B에서 일괄 적용.
+
+### 3-7. 코드에서 논문 기여의 위치 (⭐ vs ⚪)
 
 전체 코드 중 **논문 고유 기여는 약 5%**. 나머지는 표준 부품(ViT patchify, Attention+RoPE+QK-Norm, SwiGLU, Qwen3, FLUX.2 VAE, Flow Matching).
 
@@ -162,7 +209,7 @@ patch_embed/unpatchify, RoPE(이미지 2D / 텍스트 identity), QK-Norm, GQA At
 | sample.py (CFG, Euler, loop) | ~330 | ⚪ |
 | text_encoder, vae 래퍼 | ~200 | ⚪ |
 
-### 3-7. MMS 폭주 메커니즘 ↔ 코드 요소 매핑
+### 3-8. MMS 폭주 메커니즘 ↔ 코드 요소 매핑
 
 Q1의 5가지 폭주 원인을 코드의 어떤 부분이 차단하는지.
 
