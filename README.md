@@ -8,5 +8,6 @@
 
 | No | Title | Venue | Paper | Code | Reviewed |
 |---|---|---|---|---|---|
+| 3 | [HiDream-O1-Image: A Natively Unified Image Generative Foundation Model with Pixel-level Unified Transformer](Diffusion/PAPER_HiDream-O1-Image.md) | Tech Report 2026 | [pdf](https://github.com/HiDream-ai/HiDream-O1-Image/blob/main/assets/HiDream-O1-Image.pdf) | [github](https://github.com/HiDream-ai/HiDream-O1-Image) | 2026-05-13 |
 | 2 | [Z-Image: An Efficient Image Generation Foundation Model](Diffusion/PAPER_Z-Image.md) | arXiv 2025 | [arxiv](https://arxiv.org/abs/2511.22699) | [github](https://github.com/Tongyi-MAI/Z-Image) | 2026-05-13 |
 | 1 | [Mean Mode Screaming: Mean–Variance Split Residuals for 1000-Layer Diffusion Transformers](Diffusion/PAPER_MVSplit-DiT.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2605.06169) | [github](https://github.com/erwold/mv-split) | 2026-05-13 |
