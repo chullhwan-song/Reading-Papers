@@ -6,6 +6,6 @@
 
 ## 📂 Diffusion
 
-| No | Title | Paper | Code |
-|---|---|---|---|
-| 1 | [MV-Split DiT](Diffusion/PAPER_MVSplit-DiT.md) | [arxiv](https://arxiv.org/abs/2605.06169) | [github](https://github.com/erwold/mv-split) |
+| No | Title | Venue | Paper | Code | Reviewed |
+|---|---|---|---|---|---|
+| 1 | [MV-Split DiT](Diffusion/PAPER_MVSplit-DiT.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2605.06169) | [github](https://github.com/erwold/mv-split) | 2026-05-13 |
