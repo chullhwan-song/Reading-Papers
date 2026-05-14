@@ -102,6 +102,12 @@
 
 ### 1. PixArt block = "기존 DiT block + 4가지 변경"
 
+<p align="center">
+  <img src="figures/pixart_alpha_fig4.png" alt="PixArt-α Architecture (Fig. 4)" width="380"/>
+</p>
+
+> **Fig. 4** — Model architecture of PixArt-α. A cross-attention module is integrated into each block to inject textual conditions. To optimize efficiency, all blocks share the same adaLN-single parameters for time conditions. (위 그림: 논문 Figure 4)
+
 본질적으로 **DiT를 최대한 보존하면서 텍스트 능력만 추가**한 구조. 하지만 단순한 "cross-attention 추가"가 아니라 **추가 1 + 수정 3** 이 같이 일어남.
 
 ```
