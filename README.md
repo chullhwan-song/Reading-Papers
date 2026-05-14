@@ -1,12 +1,12 @@
 # Reading-Papers
 
-논문 리뷰 정리. 주제별 폴더 안에 `PAPER_*.md` 형식으로 보관합니다. 테이블은 **최신 리뷰가 위쪽**.
+논문 리뷰 정리. 주제별 폴더 안에 `PAPER_*.md` 형식으로 보관합니다. 테이블은 **최신 업데이트가 위쪽**.
 
 ---
 
 ## 📂 Diffusion
 
-| No | Title | Venue | Paper | Code | Reviewed |
+| No | Title | Venue | Paper | Code | Updated |
 |---|---|---|---|---|---|
 | 4 | [PixArt-α: Fast Training of Diffusion Transformer for Photorealistic Text-to-Image Synthesis](Diffusion/PAPER_PixArt-alpha.md) | ICLR 2024 (Spotlight) | [arxiv](https://arxiv.org/abs/2310.00426) | [github](https://github.com/PixArt-alpha/PixArt-alpha) | 2026-05-14 |
 | 3 | [HiDream-O1-Image: A Natively Unified Image Generative Foundation Model with Pixel-level Unified Transformer](Diffusion/PAPER_HiDream-O1-Image.md) | Tech Report 2026 | [pdf](https://github.com/HiDream-ai/HiDream-O1-Image/blob/main/assets/HiDream-O1-Image.pdf) | [github](https://github.com/HiDream-ai/HiDream-O1-Image) | 2026-05-14 |
