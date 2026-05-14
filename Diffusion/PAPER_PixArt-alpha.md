@@ -596,6 +596,101 @@ PixArt 시리즈 공통 철학: "**작은 모델 + 좋은 데이터 + 점진적 
 | **사전학습 가중치 재활용** | HiDream-O1 (Qwen3-VL backbone), Z-Image |
 | **소규모 데이터 + 효율적 학습** | Z-Image (6B, 314K H800h) 직접적 영감 |
 
+### Q13. 사전학습 DiT를 그대로 쓰면 성능이 좋아지는 게 당연한 거 아닌가? FAIR한 비교 맞나?
+
+**비판은 정당함**. 사전학습 모델을 출발점으로 쓰면 학습 효율이 좋아지는 건 당연. 그러나 PixArt-α의 진짜 기여는 "유리해진다"가 아니라 **"다른 구조(DiT) 모델 가중치를 텍스트 조건부 T2I에 어떻게 깔끔히 옮기느냐"의 방법론(reparameterization)**.
+
+**핵심 반론 4가지**:
+
+1. **다른 T2I 모델들도 사전학습 자원 활용** — SD 1.5는 CLIP frozen + LDM 사전학습, Imagen은 T5-XXL frozen. PixArt-α만 사전학습 쓴 게 아님. 단지 백본(DiT) 자체를 옮긴 게 새로움.
+
+2. **DiT pretrain 비용 포함해도 SD 1.5의 13%**:
+   - PixArt-α 직접 학습: 753 A100 days
+   - + DiT ImageNet pretrain: 약 80 A100 days
+   - **합계 ~833 days vs SD 1.5의 6,250 days → 13% 수준**
+
+3. **데이터 효율은 사전학습으로 다 설명 안 됨** — PixArt-α는 25M, SD 1.5는 2,000M. **1/80 데이터**. 이 격차는 사전학습 활용만으론 설명 못 함. SAM-LLaVA dense caption + 3단계 학습 분해의 효과.
+
+4. **이전 시도들은 잘 안 됐다** — Masked-DiT, U-ViT 등 PixArt 이전 DiT 기반 T2I 시도들은 학습 효율이 SD보다 별로. PixArt-α 이전엔 **DiT pretrained → T2I 변환 표준이 없었음**. PixArt-α가 처음 깔끔히 풀어내서 SD3, FLUX, Z-Image 모두 이 패턴 차용.
+
+**논문이 더 강조했어야 할 부분**: DiT pretrain 비용을 학습 비용 비교에 명시적으로 포함했어야 함 (753 days만이 아니라 "DiT pretrain 포함 ~833 days"). 후속작들(PixArt-Σ, Z-Image)은 이 비판을 의식해 사전학습 비용을 더 명시적으로 다룸.
+
+### Q14. Cross-attention을 추가했는데 왜 모델이 더 작아? DiT보다 커져야 하지 않나?
+
+**실제로는 정반대로 DiT보다 65M 작음** (DiT-XL/2 0.68B → PixArt-XL/2 0.61B). 영리한 "추가 + 절감" 동시 진행 결과.
+
+**파라미터 변화 분해** (D=1152, depth=28):
+
+| 변경 | 파라미터 변화 | 세부 |
+|---|---|---|
+| ② adaLN → adaLN-single | **-215M** | 28×6·D² (223M) → 1×6·D² + 28×6·D (8M) |
+| ① Cross-Attention 추가 | **+148M** | block당 q+kv+proj ≈ 5.3M × 28 block |
+| ③ class_embed → Caption Embedder | +5M | nn.Embedding(1000,D) 제거, Caption MLP 추가 |
+| ④ FinalLayer → T2IFinalLayer | -2M | adaLN-single 패턴으로 재구성 |
+| **순합계** | **-64M** | 675M → 611M |
+
+**핵심 통찰**: PixArt-α는 **"새 기능 추가" + "기존 비효율 제거"를 동시에** 했음. 일반적인 설계는 "기능 추가 시 파라미터 증가"가 자연스러운데, PixArt-α는 modulation MLP 절감(-215M)이 cross-attn 추가(+148M)보다 더 커서 **net으로는 작아짐**.
+
+**가정**: adaLN-single 없이 cross-attn만 추가했다면 0.82B가 되어 SD 1.5(0.9B)에 근접 → "**작은 모델로 SOTA**" 메시지가 약해졌을 것. adaLN-single이 cross-attn 추가 비용을 상쇄했기에 PixArt-α의 핵심 인상이 가능.
+
+DiT의 modulation이 전체 파라미터의 **33%(223M)** 였고, 저자들이 "**block 28개가 사실상 비슷한 modulation 동작**"임을 실험으로 발견 → 글로벌 1개 + 작은 보정으로 충분하다는 통찰.
+
+### Q15. 본질 한 문장으로 정리하면?
+
+**"기존 모델(DiT) 이용 + 파인튜닝 + 구조 변화로 더 큰 모델 따라잡기"** 가 정확한 본질. 다만 세 가지 정밀화:
+
+1. **"파인튜닝"이라기보단 "능력 추가형 학습"** — 일반 fine-tuning은 기존 능력 유지 + 약간 조정. PixArt-α는 완전히 다른 modality(텍스트) 처리 능력을 cross-attn으로 새로 학습 (init=0에서 출발). LoRA와 다른 패턴.
+
+2. **"구조 변화"는 양방향** — 새 기능 추가(cross-attn +148M) + 기존 비효율 제거(adaLN-single -215M)의 동시 진행. → Q14 참조.
+
+3. **"따라잡았다"의 정밀한 의미**:
+
+| 비교 차원 | PixArt-α 0.6B | 따라잡은 대상 |
+|---|---|---|
+| 이미지 품질 (FID) | 7.32 | Imagen 3B (7.27) — **동급** |
+| 텍스트 정합 | 0.69 (Color) | SDXL 2.6B (0.64) — **능가** |
+| 학습 비용 | 753 days | SD 1.5 6,250 days — **12%** |
+| 추론 속도 | 2.2s | SDXL 3.8s — **빠름** |
+
+→ "**완벽한 SOTA 추월**"이 아니라 **"동급/일부 능가 + 압도적 효율"**. "적은 비용으로 큰 모델 성능을 따라잡았다"가 가장 정확.
+
+**최종 한 문장**: 이미지 패턴은 이미 아는 사전학습 DiT(0.68B)를 출발점으로, 텍스트 능력은 cross-attention 한 layer만 새로 끼워 넣고(+148M), 동시에 modulation MLP의 비효율을 제거(-215M)해서, 결과적으로 더 작은 0.61B 모델로 3단계 점진 학습을 거쳐 자기보다 4~5배 큰 SDXL·Imagen·Midjourney급 품질을 1/10 비용에 달성한 논문.
+
+### Q16. 이어서 학습하면 더 향상되는 거 아닌가?
+
+**맞다. 그리고 후속작들이 정확히 그 방향으로 진화**. 다만 한계 3가지가 있어 무한정 좋아지진 않음.
+
+**후속작 진화 경로**:
+
+| 모델 | 변경 방향 | 결과 |
+|---|---|---|
+| **PixArt-Σ** (2024-03) | 모델 0.6B 유지 + 데이터 25M → 33M + 4K 해상도 | SDXL 능가 |
+| **Z-Image** (2025-11) | 모델 6B로 10배 키움 + 더 많은 학습 | SOTA |
+| **HiDream-O1** (2026-05) | LLM backbone (Qwen3-VL 8B)으로 modality 확장 | 멀티모달 통합 |
+
+→ 사용자 직관 그대로 "**기존 모델 재활용 + 능력 추가 + 이어서 학습**"이 현대 생성 모델의 표준 설계 철학.
+
+**일반화된 패턴** ([[reference-pretrained-backbone-reuse-landscape]] 참조):
+
+| 모델 | 재활용 백본 | 추가 능력 |
+|---|---|---|
+| PixArt-α | ImageNet DiT | 자유 문장 → 이미지 |
+| IP-Adapter | 기존 T2I | 참조 이미지 (스타일/인물) |
+| ControlNet | SD 1.5 | 외부 조건 (엣지/깊이/포즈) |
+| LoRA | SD/PixArt | 특정 스타일/캐릭터 |
+| PixArt-δ | PixArt-α | LCM (4-step 추론) |
+| HiDream-O1 | Qwen3-VL LLM | 이미지 생성 |
+
+**무한 향상의 3가지 한계**:
+
+1. **Catastrophic Forgetting (재앙적 망각)** — 텍스트로 너무 오래 학습 시 원래 픽셀 능력 손상 가능. PixArt-α의 reparameterization(cross-attn zero-init)이 이 문제 완화책.
+
+2. **모델 크기 천장** — 0.6B는 표현력 본질적 한계. 데이터 늘려도 SDXL/FLUX의 디테일을 완전히 따라잡기 어려움. → 그래서 FLUX(12B), Z-Image(6B), HiDream-O1(8B)는 모델 크기를 키우는 방향 선택.
+
+3. **데이터 다양성 한계** — SAM 1100만 장은 일상 사진 편향. 추상화/일러스트/만화 등에 약함.
+
+→ 어느 지점부터는 **모델 크기 확장 / 새 학습 패러다임(RLHF, DMD distillation) / 멀티모달 확장** 이 필요. PixArt 시리즈는 "0.6B 유지"를 정체성으로 가져가지만, 시장은 두 방향(작고 효율적 vs 크고 품질 좋음)으로 갈라짐.
+
 ---
 
 ## 핵심 인사이트 (일반화 가능한 교훈)
