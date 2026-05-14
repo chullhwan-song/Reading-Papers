@@ -1,0 +1,417 @@
+# PAPER_Sana
+
+> SANA: Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers
+> NVIDIA · MIT HAN Lab · Tsinghua, 2024-10-14
+
+---
+
+## 📋 메타 정보
+
+| 항목 | 내용 |
+|---|---|
+| **논문 제목** | SANA: Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers |
+| **저자** | Enze Xie, Junsong Chen, Junyu Chen, Han Cai, Haotian Tang, Yujun Lin, Zhekai Zhang, Muyang Li, Ligeng Zhu, Yao Lu, Song Han (총 11명) |
+| **소속** | NVIDIA · MIT HAN Lab · Tsinghua University |
+| **공개일** | 2024-10-14 (v1, arXiv) — v3 2024-10-20 |
+| **분야** | Text-to-Image Generation, Diffusion Transformer, Efficient Inference |
+| **논문 링크** | [arxiv abstract](https://arxiv.org/abs/2410.10629) · [PDF](https://arxiv.org/pdf/2410.10629) · [HTML](https://arxiv.org/html/2410.10629v3) |
+| **코드** | [github.com/NVlabs/Sana](https://github.com/NVlabs/Sana) (Apache-2.0) |
+| **자매 논문 (DC-AE)** | [arxiv 2410.10733](https://arxiv.org/abs/2410.10733) — 같은 그룹 같은 날 공개, Sana는 이걸 가져다 사용 |
+| **외부 모델** | Gemma-2-2B-IT (텍스트 인코더, Google 사전학습 그대로) |
+| **외부 데이터** | VLM 캡션 (VILA-3B/13B, InternVL2-8B/26B로 합성) |
+| **백본 분류** | DiT 본체는 scratch + 텍스트 인코더만 (C) 분기 LLM 재사용 하이브리드. 가장 가까운 비교: PixArt-Σ + Gemma로 갈아끼운 효율 극단화 버전 |
+
+---
+
+## 📚 주요 용어 사전 (Glossary)
+
+### 아키텍처 · 압축
+
+- **DC-AE (Deep Compression Autoencoder)** — 이미지를 잠재공간 (latent space) 으로 압축하는 오토인코더 (autoencoder). 기존 SD VAE의 8배 압축을 **32배까지 끌어올린 것**. 별도 자매 논문에서 학습한 가중치를 Sana에서 가져다 사용. (즉 Sana 안에서 새로 학습한 게 아님)
+- **F32C32P1** — Sana의 잠재 공간 표기법. F=공간 다운샘플 비율 32배, C=잠재 채널 수 32, P=DiT의 패치 크기 1. 기존 SD VAE는 F8C4P2 (8배·4채널·patch 2).
+- **잠재 공간 (latent space)** — 이미지 픽셀을 직접 다루는 대신 압축된 표현 공간에서 작업. 메모리·연산 절감의 핵심.
+- **Linear DiT** — 이미지 토큰 사이의 어텐션을 **선형 복잡도 (linear complexity, O(N))** 로 만든 Diffusion Transformer. 기존 DiT는 토큰 수² (O(N²)) 라서 4K 같은 고해상도에 치명적.
+- **LiteLA (Lightweight Linear Attention)** — Sana가 실제로 쓰는 선형 어텐션 모듈. ReLU 기반 커널 트릭으로 softmax 없이 어텐션을 계산함.
+- **Mix-FFN (= GLUMBConv)** — Linear DiT의 피드포워드 (feed-forward network, FFN). 일반 MLP 대신 **3×3 깊이별 합성곱 (depthwise convolution)** 을 끼워 넣어 위치 정보와 지역성 (local pattern) 보강.
+- **NoPE (No Positional Embedding)** — 별도의 위치 임베딩 (positional embedding) 을 제거. Mix-FFN 안의 zero-padding된 3×3 conv가 위치 단서를 암묵적으로 제공해줌.
+
+### 텍스트 조건
+
+- **Decoder-only LLM Text Encoder** — T5 같은 인코더-디코더 구조 대신 **한 방향으로만 흐르는 LLM (decoder-only, GPT 계열)** 인 Gemma-2-2B-IT를 텍스트 인코더로 사용.
+- **CHI (Complex Human Instruction)** — 사용자 프롬프트 앞에 길고 정교한 시스템 지시문을 붙이는 프롬프트 엔지니어링 기법. LLM의 instruction-following 능력을 활용해 캡션을 정제·확장.
+
+### 학습 · 샘플링
+
+- **Flow Matching** — 노이즈 → 이미지 경로를 직선화한 학습 방식. SD3·FLUX·Sana 모두 채택.
+- **Flow-DPM-Solver** — Flow Matching 학습 모델에 기존 **DPM-Solver++** (속도 빠른 ODE solver) 를 적응시킨 샘플러. 28~50 step → 14~20 step으로 절반 감소.
+
+### 평가 지표
+
+- **rFID (reconstruction FID)** — 오토인코더가 이미지를 압축·복원했을 때 화질 지표. 낮을수록 좋음.
+- **GenEval** — 텍스트-이미지 정합성 (객체 수·색·위치 등) 자동 평가.
+- **DPG-Bench** — 복잡한 long prompt에 대한 정합성 평가.
+- **MJHQ-30K FID** — Midjourney 스타일 데이터셋 FID.
+- **ImageReward** — 인간 선호도를 학습한 보상 모델 점수.
+
+---
+
+## 🎯 논문 요약 (TL;DR)
+
+**0.6B/1.6B의 작은 DiT로 4K 이미지를 FLUX-12B 대비 약 100배 빠르게 생성하는 텍스트-이미지 모델.**
+
+핵심 아이디어 4가지:
+
+1. **32배 압축 오토인코더 (DC-AE)** — 잠재 토큰 수를 1024² 기준 16,384 → 1,024로 16배 줄임 (메모리 절감의 1차 동력)
+2. 모든 self-attention을 **선형 어텐션 (Linear Attention, LiteLA)** 로 교체 — 토큰 수² → 토큰 수에 비례하도록 (특히 4K에서 결정타)
+3. T5-XXL (4.7B) 대신 작은 **decoder-only LLM (Gemma-2-2B)** 로 프롬프트 인코딩 — 6× 빠르고 instruction-following 능력 활용
+4. **Flow-DPM-Solver** 로 샘플링 step을 28~50 → 14~20으로 절반 단축
+
+검증: 1024² 1.6B 모델 1.2초/장 (FLUX-dev 23초의 1/19), **4K 9.6초** (FLUX 469초의 1/49), RTX 4090 INT8 0.37초/장.
+
+---
+
+## ⭐ 핵심 기여 (Contributions)
+
+1. **DC-AE (32× 압축 오토인코더)** — 단순히 깊이만 늘리면 rFID 0.31→0.82로 무너지는 문제를 **잔차 연결 (residual autoencoding) + 다단계 학습** 으로 해결. rFID 0.34로 SDXL VAE (0.31) 동급 화질 유지. **자매 논문 ([arxiv 2410.10733](https://arxiv.org/abs/2410.10733))** 에서 별도 학습된 가중치를 가져옴.
+
+2. **Linear DiT** — 표준 self-attention을 **LiteLA (ReLU 커널 기반 선형 어텐션)** 로 전부 교체. cross-attention만 표준 유지 (텍스트 토큰은 적기 때문). 추가로 **Mix-FFN (GLUMBConv)** 로 선형 어텐션의 약한 지역성 보강 + **NoPE** 로 positional embedding 제거.
+
+3. **Decoder-only LLM 텍스트 인코더 (Gemma-2-2B-IT)** — 이전 시도들이 실패한 이유 (Gemma 임베딩 분산이 T5보다 수 자릿수 큼 → NaN loss) 를 **RMSNorm + learnable scale 0.01** 의 단순한 트릭으로 해결. CHI 프롬프트 엔지니어링으로 GenEval +2.0 추가 향상.
+
+4. **Flow-DPM-Solver** — t≈T (순수 노이즈 근처) 에서 noise 예측은 불안정하지만 **data 예측은 거의 상수처럼 안정** 한 점을 이용해 DPM-Solver++의 σ_t 파라미터화를 Flow Matching에 이식. 14~20 step으로 28~50 step 수준 품질 달성.
+
+5. **End-to-end 효율 시스템** — 4가지 컴포넌트의 곱셈으로 1.6B 모델이 1024² 1.2초, **4K 9.6초** (FLUX-dev 469초 → 49× 가속), RTX 4090 INT8 0.37초/장.
+
+---
+
+## 🛠️ 주요 알고리즘 설명
+
+### ① DC-AE (Deep Compression Autoencoder)
+
+**문제:** 기존 SD VAE는 8배 다운샘플 (F8C4). 1024² → 128×128×4 = 65,536 latent 값. DiT에서 patch=2 묶어도 4,096 토큰. **4K (4096²)** 가 되면 65,536 토큰이 되어 O(N²) attention이 폭발.
+
+**해결:** **32배 다운샘플 + 32 채널 (F32C32)**. 1024² → 32×32×32 = **1,024 토큰** (16× 감소).
+
+**구조 (코드 [diffusion/model/dc_ae/efficientvit/models/efficientvit/dc_ae.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/dc_ae/efficientvit/models/efficientvit/dc_ae.py)):**
+
+```
+Encoder: project_in (3 → 128 ch)
+       → 6 stages (width=[128, 256, 512, 512, 1024, 1024], depth=[2]×6)
+       → 각 stage마다 EfficientViT block + 2× spatial 다운샘플
+       → project_out (→ 32 ch latent)
+Decoder: 대칭 역순
+유효 다운샘플: 2^(6-1) = 32배
+```
+
+**왜 32배가 가능한가:** SD VAE를 단순히 깊게 쌓으면 정보 병목 (information bottleneck) 으로 화질이 무너짐 (rFID 0.31 → 0.82). DC-AE는 **잔차 연결을 압축 단계에 추가** 하고 **저해상도 → 고해상도로 다단계 finetune** 해서 정보 손실을 막음.
+
+**rFID 비교 (논문 Table 1):**
+
+| AE | 압축 | 채널 | rFID ↓ | PSNR ↑ |
+|---|---|---|---|---|
+| SDXL VAE | 8× | 4 | 0.31 | 31.41 |
+| SD VAE F32C64 (naive 확장) | 32× | 64 | **0.82** ❌ | — |
+| **DC-AE F32C32 (Sana)** | 32× | 32 | **0.34** ✅ | 29.29 |
+
+> **주의:** DC-AE 자체의 학습 디테일은 [자매 논문 (arxiv 2410.10733)](https://arxiv.org/abs/2410.10733) 에 있음. Sana 본 논문은 인용만 함. 보통 두 논문을 짝으로 읽음.
+
+### ② Linear DiT — LiteLA (ReLU Linear Attention)
+
+**문제:** 표준 self-attention은 `softmax(QK^T)V` → O(N²) 메모리·연산.
+
+**LiteLA 핵심 수식:**
+
+```
+Out_i = ReLU(Q_i) · Σⱼ ReLU(Kⱼ)^T Vⱼ  /  ReLU(Q_i) · Σⱼ ReLU(Kⱼ)^T 1
+```
+
+→ softmax 대신 ReLU를 커널 함수로 쓰면 **행렬 곱의 순서를 바꿀 수 있음:**
+
+- 표준 방식: `(Q K^T) V` → 토큰 수×토큰 수 행렬을 먼저 만듦 → O(N²)
+- 선형 방식: `Q (K^T V)` → `K^T V` (D×D, 토큰과 무관한 작은 행렬) 를 먼저 → O(N·D²) → **토큰 수 N과 무관**
+
+**실제 코드 ([diffusion/model/nets/sana_blocks.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/nets/sana_blocks.py)):**
+
+```python
+class LiteLA(Attention_):
+    def attn_matmul(self, q, k, v):
+        q = self.kernel_func(q)              # ReLU(Q)
+        k = self.kernel_func(k)              # ReLU(K)
+        v = F.pad(v, (0,0,0,1), value=1)     # 정규화 분모용 1 패딩
+        vk = torch.matmul(v, k)              # (D+1, D) 작은 행렬 — 토큰 수와 무관
+        out = torch.matmul(vk, q)
+        out = out[:,:,:-1] / (out[:,:,-1:] + self.eps)
+        return out
+```
+
+**Triton 커널 융합:** activation, padding, division 같은 element-wise 연산을 행렬곱과 융합해 GPU 메모리 전송 오버헤드 최소화.
+
+**cross-attention은 표준 유지:** 텍스트 토큰 수가 작아서 O(N²) 부담이 없기 때문.
+
+### ③ Mix-FFN (GLUMBConv) — 위치 정보 + 지역성 보강
+
+선형 어텐션의 약점: 표준 softmax 어텐션보다 **지역 패턴 (local pattern)** 캡처가 약함. NoPE까지 더하면 위치 정보도 부족해짐.
+
+**해결:** FFN을 단순 MLP에서 **GLU + MBConv (역방향 residual + 3×3 깊이별 합성곱)** 로 교체.
+
+```
+Mix-FFN = Inverted Residual Block
+       └─ 1×1 conv (expand) → 3×3 depthwise conv → GLU gate → 1×1 conv (project)
+```
+
+- **3×3 conv가 지역성 회복**
+- **zero-padding이 절대 위치 단서 (보더 효과)** 를 제공 → positional embedding을 제거해도 (NoPE) 성능 손실 없음
+
+코드 config: `ffn_type: glumbconv`.
+
+### ④ Decoder-only LLM Text Encoder (Gemma-2-2B-IT)
+
+**왜 T5 대신 Gemma인가:**
+
+| 비교 | T5-XXL (4.7B) | Gemma-2-2B-IT |
+|---|---|---|
+| 인코딩 속도 | 기준 | **6× 빠름** |
+| Instruction-following | 약함 | 강함 (RLHF 학습됨) |
+| 다국어 | 영어 위주 | 다국어 사전학습 (zero-shot 중국어/이모지 가능) |
+| 추론 메모리 | 큼 | 작음 |
+
+**학습 안정화 트릭 ⭐:** Gemma의 텍스트 임베딩 분산 (variance) 이 T5보다 **수 자릿수 크다** → 그대로 cross-attention에 넣으면 학습 발산 (NaN loss).
+
+해결:
+- **RMSNorm으로 임베딩 분산을 1.0으로 정규화**
+- **작은 learnable scale factor (초기 0.01)** 적용 → 학습 초기 조심스럽게 통합
+- 코드: `attention_y_norm` ([diffusion/model/nets/sana.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/nets/sana.py))
+
+→ 이 트릭이 **이전 시도들이 실패한 핵심 차이.** Decoder-only LLM을 텍스트 인코더로 쓰려는 시도는 이전에도 있었으나 학습 안정화에서 막혔음.
+
+**CHI (Complex Human Instruction):** 사용자 프롬프트 앞에 시스템 지시문 prepend (예: "You are a prompt expert. Below is a description...") → LLM이 캡션을 정제·확장해서 cross-attention에 전달.
+
+- 52K step 기준: GenEval 45.5 → 47.7 (+2.2)
+- 140K + 5K finetune: 52.8 → 54.8 (+2.0)
+
+### ⑤ Flow-DPM-Solver
+
+기존 Flow Matching 추론은 **Flow-Euler** (1차 적분) → 28~50 step.
+
+**핵심 아이디어:** DDPM은 noise 예측이 보통이지만, Flow Matching은 **velocity (속도) 또는 data 예측**. t ≈ T (순수 노이즈 근처) 에선:
+- noise 예측 → 불안정
+- **data 예측 → 거의 상수처럼 안정**
+
+이 안정성을 살려 **DPM-Solver++** (2차 multistep ODE solver) 의 σ_t 파라미터화를 Flow Matching에 맞게 변환.
+
+→ **14~20 step**으로 동일 품질 달성. 구현: [diffusion/model/dpm_solver.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/dpm_solver.py).
+
+---
+
+## 📊 실험 요약
+
+### 1024×1024 메인 결과 (논문 Table 7)
+
+| 모델 | 파라미터 | FID ↓ | CLIP ↑ | GenEval ↑ | DPG ↑ | Latency (s) | 상대 속도 |
+|---|---|---|---|---|---|---|---|
+| FLUX-dev | 12B | 10.15 | 27.47 | 0.67 | 84.0 | 23.0 | 1× |
+| SD3-Medium | 2B | — | — | 0.62 | 84.1 | 4.4 | 5× |
+| PixArt-Σ | 0.6B | 6.15 | 28.26 | 0.54 | 80.5 | 1.5 | 15× |
+| **Sana-0.6B** | 0.6B | **5.81** | 28.36 | 0.64 | 83.6 | **0.9** | **26×** |
+| **Sana-1.6B** | 1.6B | **5.76** | **28.67** | **0.66** | **84.8** | 1.2 | **19×** |
+
+### 4K 생성 (A100, batch=1)
+
+- FLUX-dev: 469초
+- **Sana-1.6B: 9.6초 → ~49× 가속** (논문 표기는 100×, 12B 비교 + 추가 최적화 포함)
+
+### 엣지 디바이스 (RTX 4090, 1024px)
+
+- FP16: 0.88초/장
+- **INT8 양자화: 0.37초/장 (2.4× 가속)**
+
+### 다국어 zero-shot
+
+- 영어로만 학습. Gemma 덕분에 **중국어·이모지 프롬프트도 이해·생성**.
+
+### 후속 버전
+
+| 버전 | 출시 | 발표 | 핵심 |
+|---|---|---|---|
+| SANA-1.5 | 2025-01 | ICML 2025 | 4.8B 스케일 업, inference scaling |
+| SANA-Sprint | 2025-03 | ICCV 2025 highlight | sCM distillation, **0.1초 1-step** (H100) |
+| SANA-Video | 2025-10 | ICLR 2026 Oral | Block Causal Linear Attention 비디오 |
+| LongSANA | 2025-12 | — | 720p 27FPS 분 단위 비디오 |
+| Sol-RL | 2026-04 | — | NVFP4 rollout RL, 4.64× 수렴 가속 |
+
+### 한계
+
+- 텍스트 렌더링 (이미지 안 글자) 약함
+- 손·얼굴 디테일 종종 무너짐
+- 학습 데이터 정확 규모 비공개
+
+---
+
+## 💬 Q&A
+
+### Q1. DC-AE는 Sana 안에서 새로 만든 거야, 따로 만든 거야?
+
+**별도로 새로 학습한 오토인코더.** Sana 자체의 컴포넌트가 아니라 NVIDIA·MIT 같은 그룹이 같은 날 별도 논문으로 공개한 자매 작품.
+
+| 항목 | 내용 |
+|---|---|
+| 논문 | "Deep Compression Autoencoder for Efficient High-Resolution Diffusion Models" |
+| arxiv | [2410.10733](https://arxiv.org/abs/2410.10733) |
+| 저자 | Junyu Chen, Han Cai, Junsong Chen, Enze Xie, Song Han 등 (Sana 저자와 거의 동일) |
+| 공개일 | 2024-10-14 (Sana와 **같은 날**) |
+| 코드 | [mit-han-lab/efficientvit](https://github.com/mit-han-lab/efficientvit) (Sana는 sub-module로 포함) |
+| HF | `mit-han-lab/dc-ae-f32c32-sana-1.1` |
+
+- **scratch 학습** — SD VAE 같은 기존 오토인코더의 깊이만 늘린 게 아니라 **잔차 오토인코딩 (residual autoencoding) + 다단계 학습** 으로 처음부터.
+- Sana 논문에선 "우리는 DC-AE를 사용한다" 인용만 하고 디테일은 자매 논문에.
+- → "DC-AE 논문 + Sana 논문" 짝으로 읽는 게 표준.
+
+### Q2. 토큰 수가 작아져서 메모리가 줄어든 거지?
+
+**1차 동력은 DC-AE의 토큰 수 감소가 맞고, Linear Attention은 그 위에 얹는 2차 효율 레이어.**
+
+| 단계 | 토큰 수 (1024²) | Attention 비용 |
+|---|---|---|
+| 표준 SD VAE (F8) + Standard Attn | 16,384 | ∝ 16,384² ≈ **2.68억** |
+| DC-AE (F32) + Standard Attn | 1,024 | ∝ 1,024² ≈ **105만** |
+| **DC-AE (F32) + Linear Attn (Sana)** | 1,024 | **∝ 1,024 (선형)** |
+
+→ DC-AE가 토큰을 **16× 줄여 attention 비용 256× 감소** (1차 효과)
+→ Linear Attention이 거기서 한 번 더 **O(N²) → O(N)** 으로 1024× 감소 (2차 효과)
+
+**4K에선 Linear Attention의 진가가 폭발:**
+
+| 단계 | 4K 토큰 수 | Attention 비용 |
+|---|---|---|
+| 표준 SD VAE (F8) | 262,144 | ∝ 687억 (사실상 OOM) |
+| DC-AE + Standard | 16,384 | ∝ 2.68억 |
+| **DC-AE + Linear** | 16,384 | **∝ 16,384** |
+
+### Q3. 다른 여러 연구들과 토큰 수 비교?
+
+**1024×1024 입력 — 토큰 수 + per-token 정보량 비교 (코드 직접 검증):**
+
+| 모델 | VAE | DiT patch | **유효 압축률** | 잠재 shape | **토큰 수** | per-token 채널 | 정보량 (토큰×채널) | Attention |
+|---|---|---|---|---|---|---|---|---|
+| SDXL | KL-VAE 8× | – (UNet) | 8× | (4, 128, 128) | 16,384 | 4 | 65,536 | UNet |
+| PixArt-α / Σ | SD VAE 8× | 2 | 16× | (4, 64, 64)→p2 | 4,096 | 16 | 65,536 | Standard |
+| SD3 | 16ch VAE 8× | 2 | 16× | (16, 64, 64)→p2 | 4,096 | 64 | 262,144 | MM-DiT |
+| **FLUX.1-dev** | 16ch VAE 8× | 2 | 16× | (16, 64, 64)→p2 | 4,096 | 64 | 262,144 | MM-DiT |
+| Hunyuan-DiT | SD VAE 8× | 2 | 16× | (4, 64, 64)→p2 | 4,096 | 16 | 65,536 | Standard |
+| HiDream-O1 | 없음 (pixel) | 16 | 16× | (3, 1024, 1024)→p16 | 4,096 | 768 | 3,145,728 | Hybrid |
+| **Z-Image (6B)** | Flux VAE 8× | 2 | 16× | (16, 128, 128)→p2 | 4,096 | 64 | 262,144 | Single-stream full |
+| **Sana-1.6B** | **DC-AE 32×** | 1 | **32×** | (32, 32, 32) | **1,024** | 32 | **32,768** | **Linear (LiteLA)** |
+| **FLUX.2 Klein (4B/9B)** | **VAE 16× + pixel-shuffle 2×** | 1 | **32×** | (128, 32, 32) | **1,024** | 128 | 131,072 | Standard full |
+
+**핵심 관찰:**
+
+1. **Sana ≡ FLUX.2 Klein 토큰 수 동일 (1,024개)** — 두 모델 모두 32× 유효 압축으로 공동 1위. 채널이 32 vs 128로 다를 뿐.
+2. **Sana가 정보량 최저** (32,768) — 가장 가벼운 잠재공간.
+3. **DC-AE 영향력** — Sana (2024-10) 가 32× 압축 처음 도입 → 1년 후 FLUX.2가 더 공격적으로 채택 (2025-11). 단 FLUX.2는 채널을 키우고 attention은 standard 유지 → 다른 길.
+4. **DeepWiki 오답 정정** ⚠️ — DeepWiki는 FLUX.2 VAE를 "64× / 256 토큰"이라 표기하지만 코드 직접 검증 결과 **32× / 1,024 토큰** 이 맞음. (자세한 검증은 Q4)
+
+### Q4. FLUX.2 Klein 코드를 직접 보고 검증한 결과는?
+
+**AutoEncoder ([black-forest-labs/flux2/src/flux2/autoencoder.py](https://github.com/black-forest-labs/flux2/blob/main/src/flux2/autoencoder.py)):**
+
+```python
+@dataclass
+class AutoEncoderParams:
+    ch: int = 128
+    ch_mult: list[int] = [1, 2, 4, 4]    # 4 stages → 16× spatial 다운샘플
+    z_channels: int = 32                  # mean만 추출 (variance 32는 버림)
+
+# encode 끝부분
+z = rearrange(mean,
+    "... c (i pi) (j pj) -> ... (c pi pj) i j",
+    pi=self.ps[0], pj=self.ps[1])         # ps = [2, 2]
+```
+
+**1024² 입력 전체 흐름:**
+- conv_in: (B, 128, 1024, 1024)
+- 4 stages 다운샘플 → (B, 512, 64, 64) — **16× 공간 축소**
+- mean 추출 → (B, 32, 64, 64)
+- rearrange `ps=[2,2]` → (B, **32·2·2 = 128**, **64/2 = 32**, **32**)
+- **최종 latent: (B, 128, 32, 32)** ← 32×32 = **1,024 토큰**, per-token 128 채널
+
+**유효 압축률 = 1024 / 32 = 32×** (DeepWiki의 64×는 오답)
+
+**Transformer ([black-forest-labs/flux2/src/flux2/model.py](https://github.com/black-forest-labs/flux2/blob/main/src/flux2/model.py)):**
+
+```python
+@dataclass
+class Flux2Params:
+    in_channels: int = 128
+    
+self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=False)
+# patch embedding 없이 토큰별로 단순 Linear → patch_size = 1
+
+F.scaled_dot_product_attention(...)  # Standard full attention
+```
+
+**Klein 4B vs 9B:** VAE/토큰 수 동일, hidden_size·depth만 다름.
+
+### Q5. FLUX.2 Klein과 Sana는 토큰 수 같은데 채널 차이가 어떤 의미?
+
+**같은 1,024 토큰이지만 정보를 다르게 분포시킴.**
+
+| | Sana | FLUX.2 Klein |
+|---|---|---|
+| 토큰 수 | 1,024 | 1,024 |
+| per-token 채널 | 32 | **128** |
+| 정보량 (토큰×채널) | **32,768** | 131,072 |
+| 압축 메커니즘 | VAE 단독 32× | VAE 16× + pixel-shuffle 2× |
+| 어텐션 | Linear (LiteLA) | Standard full |
+
+**왜 채널이 다른가:**
+- 두 모델 모두 raw VAE 출력은 z_channels=32로 같음
+- FLUX.2는 spatial 정보를 추가로 채널로 옮김 (pixel shuffle 2×2 → 4× 채널 확장) → 32 × 4 = 128
+- Sana는 그 단계 없이 VAE에서 압축 다 끝냄 → 32 채널 그대로
+
+**트레이드오프:**
+- Sana: 채널이 적어서 잠재 표현력 ↓, 대신 모든 게 가벼움 (FFN·linear 비용도 적음)
+- FLUX.2 Klein: 채널이 4× 많아서 표현력 ↑, 대신 토큰별 연산 비용도 4× 무거움
+- **attention의 토큰² 비용은 같지만, FFN·linear projection 비용은 채널에 비례**
+
+### Q6. 백본 분류표 (reference_pretrained_backbone_reuse_landscape) 기준 어디?
+
+**DiT 본체는 scratch + 텍스트 인코더만 (C) 분기 LLM 재사용 하이브리드.**
+
+| Sana의 컴포넌트 | 출처 | 분기 |
+|---|---|---|
+| **DC-AE** (오토인코더) | scratch 학습 (별도 논문) | 분기 외 (새로 만듦) |
+| **Linear DiT** | scratch 학습 | 분기 외 (새로 만듦) |
+| **Gemma-2-2B-IT** (텍스트 인코더) | Google 사전학습 LLM 그대로 사용 | (C) 분기 — LLM 재사용 |
+
+→ 가장 가까운 비교 대상: **PixArt-Σ** (DiT scratch + T5). Sana는 여기서:
+- T5 → Gemma (텍스트 인코더 교체)
+- full attention → linear attention
+- F8 VAE → F32 DC-AE
+- positional embedding → NoPE
+
+→ "PixArt-Σ 계열의 효율 극단화 + (C) 분기 LLM 텍스트 인코더 도입" 의 하이브리드.
+
+### Q7. 왜 0.6B/1.6B로 작게 만들었나? 더 키우면 안 되나?
+
+**Sana의 설계 철학은 "SOTA보다 효율".** 소형 모델로 4K를 빠르게가 목표.
+
+- 후속작 SANA-1.5에서 **4.8B**로 키우긴 했지만 (ICML 2025)
+- 핵심 가치는 **RTX 4090 같은 소비자 GPU에서도 1초 안에 1024² 생성**
+- SANA-Sprint는 더 나아가 **0.1초 1-step 생성** (H100)
+
+---
+
+## 🎁 한 줄 요약 (전체)
+
+**Sana = (DC-AE 32×) × (Linear DiT LiteLA) × (Gemma-2 텍스트 인코더) × (Flow-DPM-Solver)** — 네 가지 효율 컴포넌트의 곱셈으로 **0.6B 모델이 FLUX-12B보다 26× 빠르면서 GenEval 동급**, 4K 이미지를 10초에 생성하는 완전 오픈소스 (Apache-2.0) 시스템. 코드 검증 결과 토큰 수에서 FLUX.2 Klein과 공동 1위 (1,024개), 정보량은 단독 1위로 가장 가벼움.
+
+---
+
+## 🔗 관련 메모리
+
+- [[reference_pretrained_backbone_reuse_landscape]] — Sana는 DiT scratch + (C) 분기 LLM 텍스트 인코더 재사용 하이브리드
+- [[paper_z_image]] — 비교: 정통 DiT (4K 토큰) + 데이터·distillation으로 효율 달성 (다른 길)
+- [[paper_hidream_o1_image]] — 대조: VAE/텍스트 인코더 모두 제거 vs Sana는 둘 다 유지·갈아끼움
+- [[paper_mv_split_dit]] — 대조: 깊이로 키우는 안정화 vs Sana는 가로(토큰·연산)로 줄이는 효율화
+- [[feedback_paper_summary_format]] — 본 문서 작성 형식
+- [[feedback_beginner_friendly_tone]] — 본 문서 표현 톤
