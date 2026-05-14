@@ -163,7 +163,7 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 - DM 항이 *자연 anchor* 역할 → 보상 해킹 (reward hacking) 자동 억제.
 - 일반 RLHF가 사용하는 reference-KL 제약을, 더 강한 distillation 제약 (DM)이 대체.
 
-> 이 절의 DMDR과 *후속 RLHF*의 차이는 Q1 참조.
+> 이 절의 DMDR과 *후속 RLHF*의 차이는 Q3 참조.
 
 ### 3-3. 2-단계 RLHF (증류 *후*에 진행)
 
@@ -333,7 +333,7 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 | 후처리 학습 (SFT + Distill + RLHF) | 24K | $48K |
 | **합계** | **314K** | **$628K** |
 
-> "314K"는 *GPU 시간*이지 학습 *이미지 장 수*가 아님 — 단위 오해 주의 (→ Q6).
+> "314K"는 *GPU 시간*이지 학습 *이미지 장 수*가 아님 — 단위 오해 주의 (→ Q7).
 
 ### 4-2. 인간 선호도 (Elo)
 
@@ -381,7 +381,116 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 | ⑥ 2-단계 RLHF | 3축 보상 + 5단 instruction 분해로 정렬을 *세분화* | → 3-3 |
 | ⑦ Prompt Enhancer | 외부 VLM 고정 + Z-Image만 PE-aware SFT → 세계지식 부족을 외주 | (논문 §4.8) |
 
-### Q2. 몇 스텝 증류 (Few-Step Distillation) 후에 RLHF를 한 게 맞나? 그러면 RL이 두 번 등장?
+### Q2. Single-Stream의 "가중치가 양 모달리티를 동시 학습"이 정확히 무슨 뜻인가?
+
+(Q1의 ②번 요인을 깊이 파헤치는 후속 질문.)
+
+#### 먼저 "가중치가 학습된다"의 의미
+
+가중치 (모델 파라미터, weights)는 입력을 변환하는 *행렬* — 예를 들어 `W ∈ ℝ^{3840×3840}` 크기. 학습은 그 행렬의 숫자들을 *데이터를 잘 맞히는 방향*으로 갱신하는 일.
+- *"텍스트 학습"* = 그 행렬이 텍스트 토큰을 잘 다루도록 갱신됨.
+- *"이미지 학습"* = 그 행렬이 이미지 토큰을 잘 다루도록 갱신됨.
+
+핵심 질문: **한 가중치가 *둘 다*를 잘하도록 학습될 수 있는가?** → 가능 여부가 dual vs single stream의 갈림길.
+
+#### 두 방식의 출발점이 다르다
+
+**Dual-Stream (SD3 / FLUX의 방식)** — *가중치를 둘로 쪼개기*
+
+```
+한 블록 안에 가중치가 2벌:
+
+  text 토큰 ──▶ W^text_Q, W^text_K, W^text_V  ┐
+                W^text_O, W^text_FFN          │  ← 텍스트 전용
+                                              │     (학습 신호 = 텍스트만)
+  이미지 토큰 ─▶ W^img_Q,  W^img_K,  W^img_V  │
+                W^img_O,  W^img_FFN           │  ← 이미지 전용
+                                              │     (학습 신호 = 이미지만)
+                  ↓                           │
+            [text ; img] concat ─── Joint Attention 한 번 ─▶ split
+```
+
+한 블록에 *Q, K, V, O, FFN_up, FFN_down* 각 2벌 → **12개의 행렬**. 텍스트 분기 가중치는 *텍스트 신호만* 받고, 이미지 분기 가중치는 *이미지 신호만* 받음. 12B 모델이면 사실상 *6B 텍스트 전문가 + 6B 이미지 전문가*가 따로 학습.
+
+**Single-Stream (Z-Image의 방식)** — *같은 가중치를 둘이 공유*
+
+```
+한 블록 안에 가중치가 1벌:
+
+  text 토큰 ──┐
+             │
+  이미지 토큰 ─┤── 한 시퀀스로 concat ──▶ [t1, ..., t_S, i1, ..., i_4096]
+             │
+             │                              ↓
+             │                       W_Q, W_K, W_V, W_O   ← 같은 가중치
+             │                       W_FFN_up, W_FFN_down    하나씩만
+             │                              ↓
+             │                        한 번에 Attention + FFN
+             │                              ↓
+             └──◀── 다시 split (이미지 토큰만 다음 단계로)
+```
+
+한 블록에 *Q, K, V, O, FFN_up, FFN_down* 각 1벌 → **6개의 행렬**. 같은 가중치가 *텍스트 신호 + 이미지 신호 둘 다* 받음. **데이터를 두 배로 보는 셈**.
+
+#### "유효 capacity 2배"의 진짜 의미
+
+비유로 풀면 — 출발점이 다르다:
+
+| | Dual-stream (전문가 분업) | Single-stream (양손잡이) |
+|---|---|---|
+| 학습 방식 | 6B 텍스트 전문가 + 6B 이미지 전문가 | 6B 양손잡이 1명 |
+| 각자의 시야 | 평생 텍스트만 / 평생 이미지만 | 텍스트와 이미지를 동시에 |
+| 강점 | 모달리티 안의 깊은 패턴 | **모달리티 간의 매핑** |
+| 약점 | 두 모달리티를 잇는 능력 | 단일 모달리티 깊이는 살짝 양보 |
+
+좀 더 형식적으로 — 가중치 `W`가 학습되는 양은 *그 가중치를 통과한 학습 신호의 양*에 비례:
+- Dual-stream: `W^text`는 텍스트만 통과 → 텍스트 데이터의 학습 신호만 받음.
+- Single-stream: `W`가 텍스트 + 이미지 둘 다 통과 → 양쪽 학습 신호를 *합쳐서* 받음.
+
+→ 같은 컴퓨트 예산으로 **한 가중치가 더 많고·다양한 신호로 갱신**됨. *행렬 크기가 2배*가 아니라 *학습 효율이 2배*. 이게 "유효한 capacity 2배"의 정확한 의미.
+
+#### 디코더-only LLM과의 유사성
+
+저자가 논문에서 직접 비유 — *"Inspired by the scaling success of decoder-only models"*:
+- GPT 계열의 디코더 한 줄기 (decoder-only = 한 방향으로만 흐르는 LLM 형태)가 *모든 종류의 토큰* (질문·답변·코드·시)을 같은 가중치로 처리.
+- 그 결과 작은 LLM이 큰 인코더-디코더 구조 (encoder-decoder, 예: T5)를 능가하게 됨.
+- Single-Stream DiT는 *그 교훈을 그림 생성에 그대로 옮긴* 디자인.
+
+#### 코드에서의 실제 모습
+
+[transformer.py:474-571](src/zimage/transformer.py#L474-L571) 에서 한 줄기인 게 분명함 (한 시퀀스로 합친 뒤 같은 가중치로 30번 통과):
+
+```python
+# 1. 토큰화 (둘 다 3840 차원으로 맞춤)
+image_tokens = x_embedder(image)         # (4096, 3840)
+cap_tokens   = cap_embedder(cap_feat)    # (S,    3840)
+
+# 2. 한 시퀀스로 concat
+unified = torch.cat([image_tokens, cap_tokens], dim=0)  # (4096+S, 3840)
+
+# 3. 같은 가중치로 30번 통과
+for layer in self.layers:           # ← 30개 ZImageTransformerBlock
+    unified = layer(unified, ...)    # ← 안에 Q, K, V, FFN 각 1벌
+
+# 4. 이미지 토큰만 다시 빼내 unpatchify
+```
+
+#### 단점은? — 있긴 함
+
+같은 가중치가 두 모달리티를 받으려면 학습이 까다로워짐. Z-Image의 해결책 (자세한 사양 → 3-1):
+
+| 단점 | 해결 |
+|---|---|
+| 텍스트·이미지 통계 분포가 다른데 같은 정규화 → 학습 불안정 | QK-Norm + Sandwich-Norm + tanh-게이트 잔차 |
+| 시퀀스가 길어짐 (concat) → attention 비용 ↑ | FlashAttention 2/3, 이미지 4096 + 텍스트 512 정도라 부담 작음 |
+| 텍스트 위치 vs 이미지 공간 정보가 섞임 | 3D Unified RoPE의 *축 분배* — 텍스트는 t축, 이미지는 h·w축 |
+| 처음부터 통합 백본은 학습이 어려움 | Modality-specific refiner 2층씩 (Noise Refiner = 이미지 전용, Context Refiner = 텍스트 전용) — *초기 정렬만* 따로 |
+
+#### 한 줄 요약
+
+> Dual-stream은 *"가중치를 모달리티별로 쪼개서 각자 절반의 데이터만 깊게 학습"*하는 **전문가 분업**. Single-stream은 *"같은 가중치를 두 모달리티가 함께 학습해, 한 가중치가 양쪽 신호를 모두 받음"*하는 **통합 학습**. 후자가 컴퓨트 1단위당 받는 신호의 양이 많고 모달리티 간 매핑도 자연스럽게 학습되어, 같은 6B로도 dual-stream 12B 급의 표현력에 도달.
+
+### Q3. 몇 스텝 증류 (Few-Step Distillation) 후에 RLHF를 한 게 맞나? 그러면 RL이 두 번 등장?
 
 **맞습니다.** DMDR도 RL 기반이고 후속 RLHF도 RL이라 *RL이 두 번 등장*합니다. 두 RL은 **목적이 완전히 다릅니다** — 즉 *역할이 다르다*기보다, *언제 무엇을 잡으려는지 자체가 다르다*가 정확:
 
@@ -397,7 +506,7 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 
 상세는 → 3-2, 3-3.
 
-### Q3. 증류된 모델 (distilled model)은 추가 학습이 잘 안 된다고 알려져 있는데?
+### Q4. 증류된 모델 (distilled model)은 추가 학습이 잘 안 된다고 알려져 있는데?
 
 **맞습니다.** 그래서 README가 Z-Image-Turbo의 추가 학습 가능성 (Fine-Tunability)을 *명시적으로* **N/A**로 표시합니다.
 
@@ -421,7 +530,7 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 3. **분포 붕괴 (mode collapse)**: diversity Low → 새 컨셉 주입 시 좁은 분포를 깨야 함 → 증류 안정성 손상.
 4. **DMD teacher 재현 불가**: teacher score function 없이 distillation 보존 불가.
 
-### Q4. 그런데 Distillation 후 RLHF도 *추가 학습*인데 왜 schedule이 안 깨졌나?
+### Q5. 그런데 Distillation 후 RLHF도 *추가 학습*인데 왜 schedule이 안 깨졌나?
 
 **핵심 통찰**: "추가 학습"에 두 종류가 있고, 증류 친화성이 정반대.
 
@@ -448,12 +557,12 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 
 만약 Turbo에 *굳이* LoRA를 한다면: DPO-LoRA / Reward-Weighted Regression / Distillation-aware LoRA(base에 LoRA → 다시 증류). 순수 SFT-LoRA는 비권장.
 
-### Q5. 학습셋은 어떻게 구성되고 얼마나 큰가?
+### Q6. 학습셋은 어떻게 구성되고 얼마나 큰가?
 
 - **원천 / 원천 풀 규모 / 4-모듈 인프라 / 데이터 4갈래**: 전부 → 3-4 참조.
 - **요점만**: 원천 풀은 *수십억* 장으로 추정되지만 **curated final dataset 크기는 비공개**. 합성 distillation 데이터 사용 안 함.
 
-### Q6. 그럼 314K = 30만 장 학습한 거야?
+### Q7. 그럼 314K = 30만 장 학습한 거야?
 
 **아닙니다 — 단위 오해.** 314K는 *GPU 시간*이지 *이미지 장 수*가 아닙니다.
 
@@ -471,12 +580,12 @@ $$\mathcal{L}_{\text{DMDR}} = \mathcal{L}_{\text{DM}} + \lambda \cdot \mathcal{L
 |---|---|---|
 | Compute (시간) | GPU·hour | **314K H800h** (공개) |
 | Compute (FLOPs) | TFLOPs | ≈ 10²¹ FLOPs 규모 |
-| 학습 *데이터* 장 수 | images | **비공개** (→ Q5) |
+| 학습 *데이터* 장 수 | images | **비공개** (→ Q6) |
 | 학습 step | iter | 비공개 |
 
 비교: SD 2.1 ~200K A100h, Llama 3 70B ~7M H100h. Z-Image는 20B–80B 경쟁작 대비 *한 자릿수 %* 비용.
 
-### Q7. 그럼 학습이 며칠 걸린 거야?
+### Q8. 그럼 학습이 며칠 걸린 거야?
 
 **정확한 GPU 개수가 비공개라 "며칠"은 확정 불가.** 314K H800·시간을 동시 GPU 수로 나눈 시나리오만 가능.
 
