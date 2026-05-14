@@ -32,7 +32,9 @@
 - **잠재 공간 (latent space)** — 이미지 픽셀을 직접 다루는 대신 압축된 표현 공간에서 작업. 메모리·연산 절감의 핵심.
 - **Linear DiT** — 이미지 토큰 사이의 어텐션을 **선형 복잡도 (linear complexity, O(N))** 로 만든 Diffusion Transformer. 기존 DiT는 토큰 수² (O(N²)) 라서 4K 같은 고해상도에 치명적.
 - **LiteLA (Lightweight Linear Attention)** — Sana가 실제로 쓰는 선형 어텐션 모듈. ReLU 기반 커널 트릭으로 softmax 없이 어텐션을 계산함.
-- **Mix-FFN (= GLUMBConv)** — Linear DiT의 피드포워드 (feed-forward network, FFN). 일반 MLP 대신 **3×3 깊이별 합성곱 (depthwise convolution)** 을 끼워 넣어 위치 정보와 지역성 (local pattern) 보강.
+- **커널 함수 (kernel function, φ)** — softmax처럼 모든 토큰을 동시에 묶지 않고 **각 입력에 따로 적용되는 element-wise 함수**. Sana는 가장 단순한 φ = ReLU 채택. φ를 양쪽에 따로 적용할 수 있게 만들면 행렬 곱 결합 순서를 바꿀 수 있음 (= 분배법칙 살리기).
+- **분배법칙 (distributive law)** — `(Σⱼ Aⱼ) · B = Σⱼ (Aⱼ · B)`. Linear Attention의 모든 마법이 일어나는 지점. softmax는 분모가 모든 j'에 의존해서 분배법칙을 깸 → N×N 표 강제. ReLU 같은 단순 함수로 갈아끼우면 분배법칙이 살아나 K·V를 미리 합쳐 둘 수 있음 (= O(N²) → O(N)).
+- **Mix-FFN (= GLUMBConv)** — Linear DiT의 피드포워드 (feed-forward network, FFN). 일반 MLP 대신 **3×3 깊이별 합성곱 (depthwise convolution)** 을 끼워 넣어 위치 정보와 지역성 (local pattern) 보강. **Linear attention의 표현력 손실을 보상하는 핵심 짝꿍** — Linear만 단독 교체하면 성능 떨어지지만, Mix-FFN 결합 시 표준 attention보다 우수.
 - **NoPE (No Positional Embedding)** — 별도의 위치 임베딩 (positional embedding) 을 제거. Mix-FFN 안의 zero-padding된 3×3 conv가 위치 단서를 암묵적으로 제공해줌.
 
 ### 텍스트 조건
@@ -127,36 +129,235 @@ Decoder: 대칭 역순
 
 ### ② Linear DiT — LiteLA (ReLU Linear Attention)
 
-**문제:** 표준 self-attention은 `softmax(QK^T)V` → O(N²) 메모리·연산.
+**문제:** 표준 self-attention은 `softmax(QK^T)V` → 메모리·연산 모두 **O(N²)**. 1024² 이미지의 1,024 토큰만 해도 1024² ≈ 100만 칸 행렬을 만들어야 하고, 4K 이미지 16,384 토큰이면 약 2.7억 칸 (40GB GPU도 부족).
 
-**LiteLA 핵심 수식:**
+#### 쉬운 설명 — 왜 softmax가 N² 표를 강제하는가
+
+먼저 분배법칙 (distributive law) 부터 떠올리기:
 
 ```
-Out_i = ReLU(Q_i) · Σⱼ ReLU(Kⱼ)^T Vⱼ  /  ReLU(Q_i) · Σⱼ ReLU(Kⱼ)^T 1
+(a + b + c) · d  =  a·d + b·d + c·d        ← 초등 수학
+( Σⱼ Aⱼ ) · B    =  Σⱼ ( Aⱼ · B )           ← 같은 성질, 행렬 버전
 ```
 
-→ softmax 대신 ReLU를 커널 함수로 쓰면 **행렬 곱의 순서를 바꿀 수 있음:**
+**Attention을 합으로 풀어쓰면** (softmax 일단 무시):
 
-- 표준 방식: `(Q K^T) V` → 토큰 수×토큰 수 행렬을 먼저 만듦 → O(N²)
-- 선형 방식: `Q (K^T V)` → `K^T V` (D×D, 토큰과 무관한 작은 행렬) 를 먼저 → O(N·D²) → **토큰 수 N과 무관**
+```
+Out_i = Σⱼ ( Q_i · K_jᵀ ) · V_j
+      = Q_i · ( Σⱼ K_jᵀ · V_j )           ← 분배법칙으로 Q_i 빼내기
+              ─────────────────
+              M = i와 무관한 d×d 행렬 ⭐
+```
 
-**실제 코드 ([diffusion/model/nets/sana_blocks.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/nets/sana_blocks.py)):**
+→ M (= Σⱼ K_jᵀ V_j) 를 **한 번만** 계산해두면 모든 i가 재사용. **N×N 표 안 만들어도 됨.** 이게 Linear의 핵심.
+
+**그런데 softmax가 끼면 왜 안 되는가:**
+
+```
+Out_i = Σⱼ  exp(Q_i · K_jᵀ)
+            ─────────────────────  · V_j
+            Σⱼ' exp(Q_i · K_j'ᵀ)        ← 분모가 모든 j'에 의존!
+```
+
+- 분모가 "**다른 j' 들 전부를 봐야**" 계산됨 → 한 항씩 분리 (= 분배법칙) 불가
+- 따라서 N×N 표를 **반드시 다 만들어야** softmax 정규화가 끝남 → 메모리 O(N²) 강제
+
+**가게 비유:**
+
+| | 표준 Attention (softmax) | Linear Attention (φ-kernel) |
+|---|---|---|
+| 비유 | "1:1 면접 후 줄세우기" | "점원이 미리 요약 카드 만들어두기" |
+| 흐름 | 손님 i가 점원 N명 모두와 만나 점수 매김 → 그 N개를 나란히 정규화 (softmax) | 점원들이 각자 (K_j, V_j) 를 ReLU로 변환해 합산 카드 M = Σⱼ φ(K_j)V_j 미리 작성 |
+| 손님당 비용 | N명 만남 | M 카드 1장 보기 |
+| 전체 비용 | **N² 만남** | **N 만남** |
+| 카드 재사용 | 불가 (매번 softmax 다시) | **모든 손님이 재사용** ⭐ |
+
+#### φ로 갈아끼우기 — 분배법칙 살리기
+
+핵심 발상:
+
+```
+softmax( Q · Kᵀ )      ← 두 입력이 섞인 후 정규화 (분리 불가)
+        ↓ 대체
+φ(Q) · φ(Kᵀ)           ← 각자 따로 처리 후 단순 곱셈 (분리 가능!)
+```
+
+φ는 **각 입력에 따로 적용되는 element-wise 함수** 여야 함 (그래야 분배법칙이 살아남). Sana는 가장 단순한 형태 채택: **φ = ReLU**.
+
+```
+ReLU(x) = max(0, x)        ← 음수만 0으로, 양수 그대로
+```
+
+→ 음수 유사도 (negative similarity) 라는 비상식적 상황을 자연스레 제거하면서, 행렬 만들 필요 없이 각 칸에 따로 적용 가능.
+
+**Linear Attention 변종 비교:**
+
+| 방법 | 커널 함수 φ | 특징 |
+|---|---|---|
+| Performer (FAVOR+) | 가우시안 커널 랜덤 근사 | 정확하지만 복잡 |
+| Linformer | K, V를 저차원 투영 | 시퀀스 길이 고정 |
+| Cosformer | cos 가중 | 부드러운 attention |
+| **LiteLA (Sana)** | **ReLU** | **가장 단순·빠름, Triton 융합 친화** ⭐ |
+
+#### LiteLA 핵심 수식
+
+```
+Out_i = ReLU(Q_i) · Σⱼ ReLU(Kⱼ)ᵀ · Vⱼ
+        ─────────────────────────────
+        ReLU(Q_i) · Σⱼ ReLU(Kⱼ)ᵀ · 1
+```
+
+- 분자: 값 (value) 들의 가중합
+- 분모: 가중치들의 합 (softmax의 분모 역할, 정규화)
+
+**행렬 곱 순서 변경 효과 (1024² 이미지, N=1024, d=32):**
+
+| 단계 | 표준 Attention | LiteLA (Linear) | 비율 |
+|---|---|---|---|
+| 중간 행렬 (Q·Kᵀ) | 1024×1024 = 1,048,576 칸 | **만들지 않음** | – |
+| 중간 행렬 (Kᵀ·V) | – | 32×32 = 1,024 칸 | 1/1024 |
+| 메모리 | O(N²) ≈ 1M | O(d²) ≈ 1K | **~1000× 작음** |
+| FLOPs | O(N²·d) ≈ 33M | O(N·d²) ≈ 33K | **~1000× 작음** |
+
+**4K 이미지 (N=16,384) 에선 격차가 폭발:**
+
+| | 표준 Attention | LiteLA |
+|---|---|---|
+| 중간 행렬 | 16,384² ≈ **2.7억 칸** | 32² = **1,024 칸** |
+| GPU 메모리 | 40GB도 부족 (OOM) | 가뿐 |
+
+#### 실제 코드 한 줄 한 줄
+
+📍 [diffusion/model/nets/sana_blocks.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/nets/sana_blocks.py)
 
 ```python
 class LiteLA(Attention_):
+    def __init__(self, ...):
+        self.kernel_func = nn.ReLU(inplace=False)   # φ = ReLU
+
     def attn_matmul(self, q, k, v):
+        # 입력 shape: (B, h, d, N)
+        # B=batch, h=heads, d=head_dim(=32), N=토큰수(=1024)
+        
+        # Step 1. 커널 함수 적용
         q = self.kernel_func(q)              # ReLU(Q)
         k = self.kernel_func(k)              # ReLU(K)
-        v = F.pad(v, (0,0,0,1), value=1)     # 정규화 분모용 1 패딩
-        vk = torch.matmul(v, k)              # (D+1, D) 작은 행렬 — 토큰 수와 무관
-        out = torch.matmul(vk, q)
+        
+        # Step 2. 정규화 분모 트릭 — V 끝에 모든 값이 1인 행 추가
+        v = F.pad(v, (0,0,0,1), value=1)     # (B, h, d+1, N)
+        # 한 번의 행렬곱으로 분자(d행)와 분모(1행)를 동시 계산
+        
+        # Step 3. ⭐ 핵심: 오른쪽부터 결합 (= K·V 먼저)
+        vk = torch.matmul(v, k)              # (B, h, d+1, d) — N과 무관한 작은 행렬!
+        out = torch.matmul(vk, q)            # (B, h, d+1, N)
+        
+        # Step 4. 마지막 행(분모)으로 나누어 정규화
         out = out[:,:,:-1] / (out[:,:,-1:] + self.eps)
-        return out
+        return out                           # (B, h, d, N)
 ```
 
-**Triton 커널 융합:** activation, padding, division 같은 element-wise 연산을 행렬곱과 융합해 GPU 메모리 전송 오버헤드 최소화.
+**6줄짜리** 함수가 핵심. **softmax 호출이 어디에도 없음.**
 
-**cross-attention은 표준 유지:** 텍스트 토큰 수가 작아서 O(N²) 부담이 없기 때문.
+**Triton 커널 융합:** activation, padding, division 같은 element-wise 연산을 행렬곱과 융합해 GPU 메모리 전송 오버헤드 최소화. 코드의 `triton_linear` 옵션이 이걸 활성화.
+
+#### Cross-Attention은 왜 표준 유지?
+
+```python
+if attn_type == "linear":
+    self.attn = LiteLA(...)              # ⭐ self-attention만 Linear
+# Cross-attention은 attn_type과 별개로 항상 standard
+self.cross_attn = MultiHeadCrossAttention(...)
+```
+
+| 비교 | Self-Attn (이미지↔이미지) | Cross-Attn (이미지↔텍스트) |
+|---|---|---|
+| Key/Value 토큰 수 | N_img = 1,024 | N_text ≈ 300 (3× 작음) |
+| QKᵀ 행렬 크기 | 1024² = 1M | 1024×300 = 307K |
+| 표현력 필요성 | 낮음 (지역 패턴) | **높음** (단어 → 이미지 영역 정확 매칭) |
+| 결정 | **Linear로 교체** | **Standard 유지** |
+
+→ Cross-attention은 비용도 작고 sharp focus가 더 중요해서 표준 유지.
+
+#### ⭐ 성능 비교 — Linear vs Standard Attention
+
+**단독 비교 (학계 일반론):**
+
+| 측면 | Standard (softmax) | Linear (φ-kernel) |
+|---|---|---|
+| **표현력 (expressivity)** | 높음 — sharp focus 가능 | 낮음 — 부드러운 분포만 |
+| **장기 의존성** | 강함 | 약함 |
+| **정확한 검색 (retrieval)** | 한 토큰 정확히 집어냄 | 흐릿한 평균에 가까움 |
+| **단독 벤치마크** | 기준 | 보통 1~3% 하락 |
+
+→ LLM 분야에서 Performer·Linformer 등 Linear attention이 주류에 채택되지 않은 이유 (정확한 토큰 lookup이 핵심이라).
+
+**Sana 논문의 Ablation (Table 3, 6) — 동일 모델 구조에서 attention만 바꿔 비교:**
+
+| 설정 | FID ↓ | CLIP ↑ | GenEval ↑ | Latency |
+|---|---|---|---|---|
+| Vanilla (standard) Attention + MLP | 6.0 | 28.0 | 0.51 | 1.0× |
+| **Linear Attention + MLP** | 6.5 | 27.8 | 0.49 | **0.7×** |
+| **Linear Attention + Mix-FFN (Sana 전체)** | **5.9** | **28.4** | **0.55** | **0.7×** |
+
+핵심 발견:
+1. **Linear만 단독 교체 → 약간 떨어짐** (FID 6.0 → 6.5, GenEval 0.51 → 0.49)
+2. **Linear + Mix-FFN 결합 → 표준보다 우수** (FID 5.9, GenEval 0.55)
+3. **속도는 30% 빠름**
+
+→ **Mix-FFN이 Linear attention의 표현력 손실을 정확히 보상.** 이게 Sana 논문의 진짜 발견 — "Linear을 썼다"가 아니라 "Linear이 작동하게 만드는 시스템 설계".
+
+**다른 SOTA 표준 attention 모델과의 비교 (1024×1024):**
+
+| 모델 | Attention | 파라미터 | FID ↓ | GenEval ↑ | DPG ↑ | Latency |
+|---|---|---|---|---|---|---|
+| PixArt-Σ | Standard | 0.6B | 6.15 | 0.54 | 80.5 | 1.5s |
+| SD3-Medium | MM-DiT (full) | 2B | – | 0.62 | 84.1 | 4.4s |
+| FLUX-dev | MM-DiT (full) | 12B | 10.15 | **0.67** | 84.0 | 23.0s |
+| **Sana-0.6B** | **Linear (LiteLA)** | 0.6B | **5.81** | 0.64 | 83.6 | **0.9s** |
+| **Sana-1.6B** | **Linear (LiteLA)** | 1.6B | **5.76** | 0.66 | **84.8** | 1.2s |
+
+→ FID에서는 **모든 표준 attention 모델보다 우수**, GenEval에서는 FLUX-12B와 거의 동등 (1/20 파라미터), DPG에서는 1위. **19~26× 빠름.**
+
+**왜 이미지에서는 잘 되고 LLM에서는 안 되나:**
+
+| | LLM (텍스트) | Diffusion (이미지) |
+|---|---|---|
+| Attention 패턴 | **Sharp** — "5번째 단어를 정확히 본다" | **Soft** — "주변 픽셀을 부드럽게 본다" |
+| 장기 의존성 | 매우 중요 (앞 문장 retrieval) | 비교적 덜 중요 (인접 정보가 핵심) |
+| 정확 검색 | 필수 (이름·숫자) | 거의 불필요 |
+| 지역성 | 글로벌 (멀리 있어도 정확히) | 로컬 (인접이 핵심) |
+
+→ **이미지 attention 패턴 자체가 본래 부드러워서** Linear의 약점이 큰 문제가 안 됨. Mix-FFN의 conv가 지역성을 채워주면 표준과 동등.
+
+**4K에서 격차 폭발:**
+
+| 해상도 | Standard (FLUX-dev 12B) | Linear (Sana-1.6B) | 비율 |
+|---|---|---|---|
+| 1024² | 23초 | 1.2초 | 19× |
+| 2048² (대략) | ~92초 | 3.6초 | 25× |
+| **4096² (4K)** | **469초 (8분)** | **9.6초** | **49×** ⭐ |
+
+→ 해상도 올라갈수록 Standard는 N² 비용으로 폭발, Linear은 N으로 선형 증가. **고해상도에선 Standard가 사실상 OOM되거나 비실용적**.
+
+**솔직한 트레이드오프:**
+
+| Linear가 잃는 것 | Linear가 얻는 것 |
+|---|---|
+| 이론적 표현력 (universal approximation) | 메모리 N² → N |
+| Sharp focus 필요한 task (텍스트 렌더링, 정밀한 손가락 수) | 연산 N² → N |
+| → Sana의 알려진 한계와 일치 (텍스트 렌더링·손·얼굴 약함) | 같은 GPU로 더 큰 모델·긴 시퀀스 |
+| | 엣지 디바이스 (4090 INT8 0.37초) 가능 |
+
+#### 정리: Sana의 진짜 기여
+
+**Linear attention을 썼다는 게 아니라, Linear attention이 작동하게 만든 시스템 설계.** 구체적으로:
+
+1. **Linear (LiteLA)** 로 self-attention 효율화
+2. **Mix-FFN의 3×3 conv** 로 잃어버린 지역성 보강
+3. **Cross-attention 표준 유지** 로 텍스트-이미지 sharp 매칭은 그대로
+4. **DC-AE의 32× 압축** 으로 토큰 수 자체를 1차로 줄여놓음
+
+이 4가지가 페어로 작동해야 의미 있음. 이전에도 Diffusion에 Linear attention 시도 있었으나 화질 저하로 채택 안 됨 — **Sana가 처음 표준 수준 도달.**
 
 ### ③ Mix-FFN (GLUMBConv) — 위치 정보 + 지역성 보강
 
@@ -383,7 +584,77 @@ F.scaled_dot_product_attention(...)  # Standard full attention
 - FLUX.2 Klein: 채널이 4× 많아서 표현력 ↑, 대신 토큰별 연산 비용도 4× 무거움
 - **attention의 토큰² 비용은 같지만, FFN·linear projection 비용은 채널에 비례**
 
-### Q6. 백본 분류표 (reference_pretrained_backbone_reuse_landscape) 기준 어디?
+### Q6. `softmax(QKᵀ) ≈ φ(Q)·φ(Kᵀ)` 분해가 직관적으로 잘 이해 안 가는데?
+
+→ 자세한 알고리즘·코드는 **② Linear DiT 섹션**에 있고, 여기선 직관만 짚음.
+
+**한 줄 정리:** softmax는 "모든 토큰을 한꺼번에 봐야만 정규화가 끝남" 이라서 N×N 표가 필수. ReLU 같은 단순 함수로 갈아끼우면 "각 토큰 따로 처리" 가 가능해져서, 분배법칙으로 합 순서를 바꿔 N×N 표를 우회할 수 있음.
+
+**왜 softmax는 N²를 강제하는가:**
+
+표준 attention의 한 출력 (i번 토큰의 출력):
+```
+Out_i = Σⱼ  exp(Q_i · K_jᵀ)
+            ─────────────────────  · V_j
+            Σⱼ' exp(Q_i · K_j'ᵀ)        ← 분모가 모든 j'에 의존!
+```
+
+분모를 계산하려면 **모든 j'**의 점수를 다 알아야 함. 한 항씩 분리 (= 분배법칙) 불가 → N×N 표를 다 만들어야 분모가 채워짐.
+
+**φ로 갈아끼우면 왜 살아나는가:**
+
+φ가 각 입력에 따로 적용되는 element-wise 함수면 (ReLU 같은):
+```
+Out_i = Σⱼ ReLU(Q_i)ᵀ · ReLU(K_j) · V_j
+      = ReLU(Q_i)ᵀ · ( Σⱼ ReLU(K_j) · V_j )    ← 분배법칙으로 빼낼 수 있음!
+                      ─────────────────────
+                      M = i와 무관한 d×d 행렬 ⭐
+```
+
+→ M (= Σⱼ φ(K_j)V_j) 을 **한 번만 계산해두면 모든 i가 재사용**. **N×N 표 안 만들어도 됨.**
+
+**가게 비유:**
+
+| | 표준 Attention (softmax) | Linear Attention (ReLU) |
+|---|---|---|
+| 비유 | "1:1 면접 후 줄세우기" | "점원이 미리 요약 카드 만들어두기" |
+| 흐름 | 손님 i가 점원 N명과 만나 점수 매김 → softmax 정규화 | 점원들이 (K_j, V_j) 를 ReLU 변환해 합산 카드 M 미리 작성 |
+| 손님당 비용 | N명 만남 (softmax 위해 다른 점원 다 봐야) | M 카드 1장만 보기 |
+| 전체 비용 | **N² 만남** | **N 만남** |
+| 카드 재사용 | 불가 (매번 새로) | **모든 손님이 재사용** ⭐ |
+
+핵심 한 줄: **"각 토큰을 따로 처리할 수 있는 함수"** 로 갈아끼우는 게 전부. softmax는 묶어서 봐야 정규화되므로 분리 불가, ReLU는 각자 처리 가능해 분리 가능.
+
+### Q7. Linear Attention의 성능은 표준 attention과 비교해서 어때?
+
+→ 자세한 표·수치는 **② Linear DiT 섹션 "성능 비교"** 에 있음. 핵심만 요약.
+
+**솔직한 결론: 단독으론 약간 떨어지지만, Sana 시스템 안에선 더 우수.**
+
+| 시나리오 | 결과 |
+|---|---|
+| Linear 단독 vs Standard 단독 | Linear이 **1~3% 떨어짐** (FID 6.0 → 6.5, GenEval 0.51 → 0.49) |
+| Linear + Mix-FFN vs Standard | **Linear+Mix-FFN이 더 우수** (FID 5.9, GenEval 0.55) |
+| 속도 | **Linear이 30% 빠름** |
+| 1024² 실전 (Sana-1.6B vs FLUX-12B) | FID 5.76 vs 10.15 (**Sana 우수**), GenEval 0.66 vs 0.67 (거의 동등, **20분의 1 파라미터**), Latency **19× 빠름** |
+| **4K 실전** | FLUX-dev 469초 vs Sana 9.6초 → **49× 가속** (Standard는 사실상 OOM 임계점) |
+
+**왜 LLM에선 Linear이 안 통하는데 이미지에선 잘 되나:**
+
+| | LLM (텍스트) | Diffusion (이미지) |
+|---|---|---|
+| Attention 패턴 | Sharp (정확한 토큰 retrieval 필요) | Soft (인접 픽셀을 부드럽게) |
+| Linear 적합성 | 약함 (sharp focus 손실 치명적) | 좋음 (본래 부드러운 패턴) |
+
+→ **이미지 attention 패턴이 본래 부드러워서** Linear의 약점이 큰 문제가 안 됨. Mix-FFN의 conv가 지역성을 채워주면 표준과 동등.
+
+**Sana의 진짜 기여:** "Linear attention을 썼다"가 아니라 **"Linear이 작동하게 만드는 시스템 설계"** (Linear + Mix-FFN + cross-attn 표준 유지 + DC-AE 토큰 사전 압축). 이전에도 Diffusion에 Linear attention 시도들 있었으나 화질 저하로 채택 안 됨 — **Sana가 처음 표준 수준 도달.**
+
+**솔직한 트레이드오프 (Sana의 알려진 한계와 일치):**
+- 잃는 것: sharp focus 필요한 task (텍스트 렌더링, 정밀한 손가락 수)
+- 얻는 것: 메모리 N²→N, 4K 실시간 가능, 엣지 디바이스 배포
+
+### Q8. 백본 분류표 (reference_pretrained_backbone_reuse_landscape) 기준 어디?
 
 **DiT 본체는 scratch + 텍스트 인코더만 (C) 분기 LLM 재사용 하이브리드.**
 
@@ -401,7 +672,7 @@ F.scaled_dot_product_attention(...)  # Standard full attention
 
 → "PixArt-Σ 계열의 효율 극단화 + (C) 분기 LLM 텍스트 인코더 도입" 의 하이브리드.
 
-### Q7. 왜 0.6B/1.6B로 작게 만들었나? 더 키우면 안 되나?
+### Q9. 왜 0.6B/1.6B로 작게 만들었나? 더 키우면 안 되나?
 
 **Sana의 설계 철학은 "SOTA보다 효율".** 소형 모델로 4K를 빠르게가 목표.
 
@@ -414,6 +685,8 @@ F.scaled_dot_product_attention(...)  # Standard full attention
 ## 🎁 한 줄 요약 (전체)
 
 **Sana = (DC-AE 32×) × (Linear DiT LiteLA) × (Gemma-2 텍스트 인코더) × (Flow-DPM-Solver)** — 네 가지 효율 컴포넌트의 곱셈으로 **0.6B 모델이 FLUX-12B보다 26× 빠르면서 GenEval 동급**, 4K 이미지를 10초에 생성하는 완전 오픈소스 (Apache-2.0) 시스템. 코드 검증 결과 토큰 수에서 FLUX.2 Klein과 공동 1위 (1,024개), 정보량은 단독 1위로 가장 가벼움.
+
+**Sana의 진짜 기여:** "Linear attention을 썼다"가 아니라 **"Linear attention이 작동하게 만든 시스템 설계"** — softmax를 ReLU로 갈아끼워 분배법칙을 살리고 행렬곱 순서를 (Q·K)·V에서 Q·(K·V)로 바꿔 O(N²)→O(N)을 달성하되, Mix-FFN의 3×3 conv로 잃어버린 지역성을 정확히 보상하고, cross-attention은 표준 유지로 텍스트 sharp 매칭을 챙기며, DC-AE의 32× 압축으로 토큰 수 자체를 1차로 줄여놓음. 이 4박자가 페어로 작동해 처음으로 Diffusion에서 Linear attention이 표준 수준 화질을 달성한 사례.
 
 ---
 
