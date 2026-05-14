@@ -86,6 +86,16 @@
 
 ## 🛠️ 주요 알고리즘 설명
 
+<p align="center">
+  <img src="figures/sana_fig5.png" alt="SANA Overview (Fig. 5)" width="900"/>
+</p>
+
+> **Fig. 5 — Overview of Sana.**
+> **(a) 전체 학습 파이프라인**: 입력 이미지 → **32× Deep Compression AutoEncoder (DC-AE)** → 32배 압축된 latent → **Linear DiT (N×Blocks)** (Linear Attn + Cross Attn + Mix-FFN으로 구성) → 노이즈 예측. 텍스트 조건은 **Small LLM (Gemma-2-2B-IT)** 이 처리하며, 사용자 prompt 앞에 **"Complex Human Instruction"**(CHI)을 붙여 한 번에 입력. **Positional Embedding은 빨간 X 표시 — 사용하지 않음 (NoPE)**.
+> **(b) Linear DiT 모듈 상세**: 왼쪽 **Linear Attention** (Linear+ReLU로 Q,K를 매핑, MatMul 두 번 — KᵀV를 먼저 계산해 O(N²)→**O(N)**), 오른쪽 **Mix-FFN** (1×1 ConvLayer + **3×3 ConvLayer (depthwise)** + 1×1 ConvLayer로 지역성과 위치 정보 보강). **softmax 없는 선형 attention의 약점을 Mix-FFN의 conv가 보완**하는 구조.
+
+핵심 메시지: SANA의 효율성은 단일 기법이 아니라 **3박자 조합** — (1) DC-AE로 토큰 수 자체를 1/16로 압축, (2) Linear Attention으로 잔여 토큰에 대한 attention을 O(N²)→O(N), (3) Mix-FFN으로 linear attention이 잃는 지역성 회복. 아래 ①~⑤로 각 부품을 풀어 설명합니다.
+
 ### ① DC-AE (Deep Compression Autoencoder)
 
 **문제:** 기존 SD VAE는 8배 다운샘플 (F8C4). 1024² → 128×128×4 = 65,536 latent 값. DiT에서 patch=2 묶어도 4,096 토큰. **4K (4096²)** 가 되면 65,536 토큰이 되어 O(N²) attention이 폭발.
