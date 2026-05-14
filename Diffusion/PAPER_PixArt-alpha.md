@@ -295,6 +295,121 @@ optimizer = dict(type='AdamW', lr=2e-5, weight_decay=3e-2, eps=1e-10)
 lr_schedule_args = dict(num_warmup_steps=1000)
 ```
 
+### 학습률 (Learning Rate) 디테일
+
+3단계 학습 시 lr이 어떻게 다뤄지는지가 헷갈리기 쉬운 부분. 정리하면 **"base_lr은 모든 stage에서 동일(2e-5), 단 effective_lr은 batch size에 따라 자동으로 달라진다"**.
+
+#### Stage별 LR 정보 (config 파일 추출)
+
+| Stage | 해상도 | **base_lr** | warmup | LR schedule | grad clip | batch (GPU당) |
+|---|---|---|---|---|---|---|
+| Stage 2 (Align) | 256 | **2e-5** | 1000 step | constant | 0.01 | 176 |
+| Stage 3a (512) | 512 | **2e-5** | 1000 step | constant | 0.01 | 38~40 |
+| Stage 3b (1024) | 1024 | **2e-5** | 1000 step | constant | 0.01 | 2~12 |
+| PixArt-δ (LCM) | 1024 | **2e-5** | 100 step | constant | 0.01 | 16 |
+
+→ **모든 stage에서 base_lr=2e-5, constant schedule (decay 없음), warmup 1000 step**으로 동일.
+
+#### base_lr vs effective_lr — 가장 중요한 구분
+
+config에 적힌 `lr=2e-5`는 **표기값(base_lr)** 일 뿐, 실제 옵티마이저가 weight에 적용하는 값은 다름.
+
+```
+실제 적용되는 lr = effective_lr
+                = base_lr × auto_lr_ratio × warmup_factor
+                = 2e-5    × √(BS_현재stage / base_BS) × min(step/1000, 1.0)
+```
+
+베이스 config에 명시된 **`auto_lr=dict(rule='sqrt')`** 규칙 때문에 batch size가 작아지면 effective_lr도 자동으로 작아짐. 해상도가 커지면 GPU 메모리 한계로 batch가 줄어드니, **고해상도 stage일수록 effective_lr이 자연스럽게 감소**.
+
+#### Stage별 Effective LR (warmup 후 도달값, BS 11392 기준 추정)
+
+| Stage | BS (global, 추정) | √(BS/base_BS) | **Effective LR** |
+|---|---|---|---|
+| Stage 2 (256) | 11,392 | √(11392/2048) ≈ 2.36× | **~4.7e-5** |
+| Stage 3a (512) | ~2,400 | √(2400/2048) ≈ 1.08× | **~2.2e-5** |
+| Stage 3b (1024) | ~768 | √(768/2048) ≈ 0.61× | **~1.2e-5** |
+
+→ **암묵적 LR scheduling**: 명시적 decay는 없지만 batch size 감소가 자동으로 lr을 줄여줌.
+
+#### Stage 전환 시 무엇을 이어받는가?
+
+각 stage는 별도 학습 job이고, 전환 시 **weight만 이어받고 학습 dynamics는 새로 시작**:
+
+| 항목 | Stage 전환 시 | 근거 |
+|---|---|---|
+| **모델 가중치 (weight)** | ✅ **이어받음** | `load_from = "이전 stage checkpoint"` |
+| EMA weight | ✅ 선택적 이어받음 | config의 `load_ema` 옵션 |
+| Optimizer state (Adam m, v) | ❌ **새로 초기화** | `resume_from = None` (기본값) |
+| LR scheduler state | ❌ **새로 시작** | warmup 1000 step 다시 |
+| Step counter | ❌ **0부터 다시** | epoch reset |
+
+→ **"몸은 가져가되 페이스는 다시 정한다"** — weight(능력)는 인계, optimizer/lr(학습 dynamics)는 reset.
+
+`load_from` (stage 전환용, weight만) vs `resume_from` (같은 stage 학습 재개용, 전부 복원)이 분리되어 있음.
+
+#### 실제 LR 흐름 — 그림으로
+
+```
+모든 Stage 공통 출발점: step 0 → effective_lr = 0  (warmup_factor=0)
+                            │
+                            │  1000 step 동안 선형 ramp-up
+                            ▼
+                       각 stage 도달값 (BS에 따라)
+
+Stage 2 (BS 큼):   step 0 → 0 ──warmup──→ 4.7e-5 ──→ constant 4.7e-5
+Stage 3a (BS ↓):  step 0 → 0 ──warmup──→ 2.2e-5 ──→ constant 2.2e-5
+Stage 3b (BS ↓↓): step 0 → 0 ──warmup──→ 1.2e-5 ──→ constant 1.2e-5
+```
+
+세 stage 모두 **출발선(step 0)에선 effective_lr=0으로 동일**하지만, 워밍업 후 **순항 lr이 stage마다 다름**.
+
+#### 왜 작은 lr (2e-5) + constant schedule인가? — 학계 표준과 다른 비전형적 디자인
+
+**먼저 비교** — 학계 표준 vs PixArt-α:
+
+| 학습 종류 | LR 크기 | LR Schedule | Stage별 LR 변화 |
+|---|---|---|---|
+| 처음부터 학습 (from scratch) | 큼 (1e-4) | cosine decay or step | - |
+| 표준 fine-tuning | 작음 (1e-5~5e-5) | cosine decay or constant | 보통 단계별 ↓ |
+| Multi-stage fine-tuning (보통) | 작음 | 단계별 step decay | 1e-4 → 1e-5 → 1e-6 식 |
+| **PixArt-α (예외)** | **작음 (2e-5)** | **constant (decay 없음)** | **모든 stage 동일** |
+
+→ **PixArt-α는 multi-stage fine-tuning인데도 lr decay를 명시적으로 안 씀**. 학계 표준과 다른 선택. 어떻게 가능했나?
+
+#### Constant LR이 가능한 5가지 안전 장치
+
+명시적 decay 없이도 학습이 안정적인 이유 — 다섯 가지 메커니즘이 decay 역할을 대신함:
+
+| # | 안전 장치 | 효과 |
+|---|---|---|
+| ① | **lr 자체가 작음 (2e-5)** | SD/Imagen의 1/5. decay 안 해도 큰 변동 불가능한 수준 |
+| ② | **Reparameterization** | 학습 시작점에 DiT와 동일 출력. 초반 큰 gradient 위험 원천 차단 |
+| ③ | **gradient_clip 0.01** | 일반 (1.0)의 1/100. 한 step 변동을 강제 클램핑 |
+| ④ | **BS 변화의 implicit decay** | `auto_lr='sqrt'` rule로 BS 감소 → effective_lr 자동 감소 (Stage 2 ~4.7e-5 → Stage 3b ~1.2e-5) |
+| ⑤ | **Stage 진입 warmup의 reset 효과** | 매 stage 시작 시 effective_lr이 0으로 reset → 1000 step ramp-up → mini-cyclic lr 효과 |
+
+→ **"lr decay 대신 다른 메커니즘들로 같은 효과를 달성"** 한 단순함 우선 디자인.
+
+#### 트레이드오프
+
+| 항목 | 표준 (lr decay) | PixArt (constant + 작은 lr) |
+|---|---|---|
+| 학습 초반 빠른 수렴 | ✅ 큰 lr로 빠르게 | ❌ 작은 lr이라 느림 |
+| 학습 후반 안정성 | ✅ decay로 정밀 조정 | ✅ 이미 작아서 안정 |
+| 사전학습 손상 위험 | 🟡 초반 큰 lr이 위험 | ✅ 작은 lr로 보존 |
+| 구현 복잡도 | 🟡 schedule 설계 필요 | ✅ 매우 단순 |
+| 하이퍼파라미터 수 | 많음 (peak_lr, min_lr, decay_steps) | **적음 (lr 하나)** |
+
+→ "**빠른 초기 수렴**"을 포기하고 "**보존 + 단순함**"을 가져간 트레이드오프. PixArt-α의 핵심 목표인 **사전학습 효과 보존**과 잘 맞음.
+
+#### 비유
+
+- **일반 fine-tuning** = 자동변속기 (lr scheduler가 알아서 변속)
+- **PixArt-α** = 수동변속기 (constant lr) + 자동 페이스 조절 (BS 기반 auto_lr) + 안전벨트 (grad_clip + reparam)
+
+> 💡 **핵심 통찰**: stage 간 effective_lr이 달라 보이는 건 의도된 LR scheduling이 아니라 **batch size 변화의 부산물**. **BS가 같다면 stage 간 effective_lr도 완전히 동일**. → 자세히는 [Q17](#q17-stage-전환-시-lr을-이어받나-bs가-같으면-stage-간-lr이-동일한가) 참조.
+
 ---
 
 ## 실험 요약
@@ -690,6 +805,49 @@ DiT의 modulation이 전체 파라미터의 **33%(223M)** 였고, 저자들이 "
 3. **데이터 다양성 한계** — SAM 1100만 장은 일상 사진 편향. 추상화/일러스트/만화 등에 약함.
 
 → 어느 지점부터는 **모델 크기 확장 / 새 학습 패러다임(RLHF, DMD distillation) / 멀티모달 확장** 이 필요. PixArt 시리즈는 "0.6B 유지"를 정체성으로 가져가지만, 시장은 두 방향(작고 효율적 vs 크고 품질 좋음)으로 갈라짐.
+
+### Q17. Stage 전환 시 LR을 이어받나? BS가 같으면 stage 간 LR이 동일한가?
+
+**답을 두 부분으로 나누면 명확함**:
+
+#### (1) Stage 전환 시 무엇을 이어받나?
+
+| 항목 | 이어받음? | 비유 (자동차) |
+|---|---|---|
+| **모델 weight** | ✅ 이어받음 (`load_from`) | 차의 상태(엔진/연료) 그대로 |
+| Optimizer state (Adam m, v) | ❌ 새로 초기화 | 새 운전자 |
+| LR scheduler state | ❌ 새로 시작 (warmup 1000 step 다시) | 페이스 다시 정함 |
+| Step counter | ❌ 0부터 | - |
+
+→ **"몸(weight)은 가져가되 페이스(lr/optimizer)는 다시 정함"**. effective_lr 자체는 인계 개념이 아니라 매 step `base_lr × √(BS/base_BS) × warmup_factor`로 새로 계산되는 함수값.
+
+#### (2) BS가 같으면 effective_lr도 동일한가?
+
+**✅ 맞다**. 같은 BS면 같은 auto_lr_ratio, 같은 base_lr(2e-5), 같은 warmup → **warmup 후 정상 학습 구간에서 stage 간 effective_lr 완전히 동일**.
+
+```
+effective_lr = base_lr(=2e-5) × √(BS/base_BS) × warmup_factor
+                ↑ 모든 stage 동일   ↑ BS 같으면 동일      ↑ warmup 후 1.0
+              → BS만 같으면 effective_lr도 stage 간 동일
+```
+
+#### (3) 그러면 왜 PixArt는 stage마다 effective_lr이 달라 보이나?
+
+**저자가 lr을 일부러 줄인 게 아니라**, 해상도 증가로 GPU 메모리 한계에 부딪혀 **BS를 강제로 줄였고**, `auto_lr='sqrt'` rule이 그 효과를 흡수했기 때문:
+
+| Stage | 해상도 | 토큰 수 | 메모리 부담 | 강제 BS | → effective_lr |
+|---|---|---|---|---|---|
+| 2 | 256 | 256 | 적음 | 큼 | 큼 |
+| 3a | 512 | 1024 (4×) | 4× | 중간 | 중간 |
+| 3b | 1024 | 4096 (16×) | 16× | 작음 | 작음 |
+
+→ **"고해상도 = BS 강제 감소 = effective_lr 자동 감소"** 연쇄. PixArt-α의 stage별 lr 변화는 **의도된 LR scheduling이 아니라 메모리 제약의 부산물**. `auto_lr='sqrt'` rule이 우연히 좋은 LR scheduling 역할.
+
+#### (4) 핵심 시사점
+
+> **"3단계 학습"의 본질은 lr 변화가 아니라 데이터/해상도 변화**. lr decay는 부산물. 만약 메모리 무한 가정 하에 모든 stage에서 BS를 동일하게 했다면 stage 간 effective_lr도 동일했을 것이고, 그래도 학습 효과는 유사했을 것.
+
+→ Stage별 LR 표·수식·effective_lr 추정값은 [학습 전략 섹션](#학습률-learning-rate-디테일) 참조.
 
 ---
 
