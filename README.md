@@ -8,6 +8,7 @@
 
 | No | Title | Venue | Paper | Code | Updated |
 |---|---|---|---|---|---|
+| 7 | [Lumina-Next: Making Lumina-T2X Stronger and Faster with Next-DiT](Diffusion/PAPER_Lumina-Next.md) | arXiv 2024 | [arxiv](https://arxiv.org/abs/2406.18583) | [github](https://github.com/Alpha-VLLM/Lumina-T2X) | 2026-05-15 |
 | 6 | [Efficient Diffusion Training via Min-SNR Weighting Strategy](Diffusion/PAPER_Min-SNR.md) | ICCV 2023 | [arxiv](https://arxiv.org/abs/2303.09556) | [github](https://github.com/TiankaiHang/Min-SNR-Diffusion-Training) | 2026-05-15 |
 | 5 | [SANA: Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers](Diffusion/PAPER_Sana.md) | arXiv 2024 | [arxiv](https://arxiv.org/abs/2410.10629) | [github](https://github.com/NVlabs/Sana) | 2026-05-14 |
 | 4 | [PixArt-α: Fast Training of Diffusion Transformer for Photorealistic Text-to-Image Synthesis](Diffusion/PAPER_PixArt-alpha.md) | ICLR 2024 (Spotlight) | [arxiv](https://arxiv.org/abs/2310.00426) | [github](https://github.com/PixArt-alpha/PixArt-alpha) | 2026-05-14 |
