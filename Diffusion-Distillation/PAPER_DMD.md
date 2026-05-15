@@ -9,7 +9,6 @@
 | **공개일** | 2023-11-30 (arXiv v1) / CVPR 2024 |
 | **분야** | 이미지 생성 / Diffusion Distillation / cs.CV |
 | **논문 링크** | https://arxiv.org/abs/2311.18828 |
-| **공식 코드** | https://github.com/tianweiy/DMD |
 | **본 문서 목적** | DMD 이론 + 관련 distillation 계열 (CFG distill, DMD2, VSD) 정리 |
 
 ### 관련 논문 메타데이터
