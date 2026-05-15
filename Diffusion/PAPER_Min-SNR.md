@@ -78,6 +78,15 @@
 
 ### 3.1 문제: 왜 timestep 들이 충돌하는가
 
+<p align="center">
+  <img src="figures/min_snr_fig2.png" alt="Min-SNR Fig. 2 — timestep conflict" width="640"/>
+</p>
+
+> **Fig. 2 — Timestep 간 충돌 증거.** 사전학습된 baseline 모델 (초록 가로선, Δ MSE = 0) 위에서 시작해, **특정 timestep 구간만 골라 추가 학습**시킨 뒤 전 구간의 MSE 변화를 측정한 결과.
+> - 빨강 = [100,200)만 학습 / 파랑 = [200,300)만 학습 / 노랑 = [300,400)만 학습.
+> - 각 색은 **자기 구간(점선 영역)에서는 0 아래로 내려가 손실 감소(개선)**, **하지만 멀리 떨어진 t (특히 t > 400) 에서는 위로 올라가 손실 증가(악화)**.
+> 즉 "timestep A 를 잘 학습시키면 timestep B 의 성능이 떨어지는" **multi-task gradient conflict** 가 실험적으로 확인됨. 이 충돌이 Min-SNR이 풀려는 핵심 문제.
+
 | t 구간 | 학습이 시키는 것 | 모델에게 필요한 능력 |
 |---|---|---|
 | **High noise (t ≈ T)** | 대략적 구조·색·텍스트 정합 만들기 | 의미적·전역적 정보 (coarse layout) |
