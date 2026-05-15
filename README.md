@@ -18,4 +18,4 @@
 
 | No | Title | Venue | Paper | Code | Updated |
 |---|---|---|---|---|---|
-| 1 | [One-step Diffusion with Distribution Matching Distillation](Diffusion-Distillation/PAPER_DMD.md) | CVPR 2024 | [arxiv](https://arxiv.org/abs/2311.18828) | [github](https://github.com/tianweiy/DMD) | 2026-05-14 |
+| 1 | [One-step Diffusion with Distribution Matching Distillation](Diffusion-Distillation/PAPER_DMD.md) | CVPR 2024 | [arxiv](https://arxiv.org/abs/2311.18828) | - | 2026-05-14 |
