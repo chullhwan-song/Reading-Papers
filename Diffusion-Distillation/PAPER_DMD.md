@@ -90,6 +90,30 @@
 
 ### 3.1 학습 흐름 (DMD 원논문, Yin 2024 CVPR)
 
+**원논문 Fig.2 — 전체 framework 한 장 요약**:
+
+![DMD Fig.2 framework](figures/dmd_fig2.png)
+
+*Source: Yin et al., "One-step Diffusion with Distribution Matching Distillation", CVPR 2024 (project page: tianweiy.github.io/dmd)*
+
+**그림 읽는 법** (왼쪽 → 오른쪽):
+
+| 영역 | 역할 |
+|---|---|
+| **왼쪽 (생성 + regression loss)** | `random latent z` → **one-step generator G_θ** → `fake image`. 이 fake image 와 paired dataset (teacher ODE 로 미리 만든 (z, x₀) 쌍) 의 정답 사이의 MSE = **regression loss L_reg** (학습 안정화용) |
+| **오른쪽 (Distribution Matching Gradient Computation)** | fake image 에 **diffusion 으로 노이즈 다시 씌움** → `noisy image` → **두 개의 score 네트워크** 가 병렬로 호출됨 |
+| **위쪽 path (real data score function, 자물쇠 = frozen)** | `real score` 출력 — teacher 가 표현하는 진짜 분포의 방향 |
+| **아래쪽 path (fake data score function)** | `fake score` 출력 — μ_fake critic 이 추정하는 student 분포의 방향. 같은 noisy image 로 **diffusion loss** (denoising) 도 같이 받아 같이 학습 |
+| **두 score 의 차이 (붉은 ⊖)** | `computed gradient` = `real − fake`. 이게 곧 KL gradient surrogate. **빨간 화살표 `∇_θ D_KL`** 로 G_θ 에 역전파 |
+
+**핵심 포인트** (그림에서 직접 읽힘):
+1. **두 개의 score 네트워크 분리** — frozen teacher (real) + 학습되는 critic (fake). 같은 noisy image 입력을 받음 (= "같은 위치에서 두 방향 비교").
+2. **fake image 가 다시 노이즈에 섞임** — score 가 노이즈 레벨별로만 정의되니까. (자세히는 § 6 Q7)
+3. **두 loss 가 따로 들어감** — 왼쪽 L_reg (paired regression) + 오른쪽 D_KL gradient (분포 매칭). 둘 다 G_θ 의 학습에 사용.
+4. **fake score critic 도 diffusion loss 로 동시에 학습** — student 가 분포를 바꿀 때마다 μ_fake 도 따라가야 함.
+
+**텍스트 흐름도 (등가)**:
+
 ```
                   z (가우시안 노이즈)
                        │
