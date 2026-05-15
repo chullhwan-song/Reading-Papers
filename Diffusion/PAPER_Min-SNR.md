@@ -156,6 +156,35 @@ min_{w_t}   ‖Σ_t w_t · ∇_θ L_t(θ)‖₂² + λ · Σ_t ‖w_t‖₂²
 
 두 분기 모두 핵심 식은 `min(SNR, γ)` 동일 — 차이는 분모뿐.
 
+#### SNR 은 어떻게 계산되나 — 룩업 테이블 + 한 줄 산식
+
+학습 매 step 마다 SNR 을 새로 계산하지 않고, *클래스 초기화 시점에 noise schedule 의 β 로부터 미리 계산해둔 텐서* (룩업 테이블, lookup table) 에서 timestep 인덱스로 꺼내 씀. 즉 학습 중 비용은 *나누기 + 제곱 한 번* 이 전부.
+
+```python
+# guided_diffusion/gaussian_diffusion.py:847-849 (training_losses 내부)
+alpha = _extract_into_tensor(self.sqrt_alphas_cumprod, t, t.shape)   # √ᾱ_t (신호 계수)
+sigma = _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, t.shape)  # √(1-ᾱ_t) (노이즈 계수)
+snr = (alpha / sigma) ** 2                                            # SNR(t) = ᾱ_t / (1-ᾱ_t)
+```
+
+- `self.sqrt_alphas_cumprod`, `self.sqrt_one_minus_alphas_cumprod` 는 `GaussianDiffusion.__init__` 에서 β schedule (cosine / linear) 로부터 *전체 timestep 분량을 미리 cumprod 계산* 해둔 1D 텐서 (길이 = `num_timesteps`, 보통 1000).
+- `_extract_into_tensor(table, t, shape)` 는 *룩업 + 배치 모양으로 broadcast* 만 해주는 헬퍼.
+- 한 줄로 정리하면: **SNR(t) = α_t² / σ_t² = ᾱ_t / (1-ᾱ_t)** — 논문 표기 그대로.
+
+#### 별도 헬퍼: `get_snr()` (시각화용)
+
+[`gaussian_diffusion.py:69-106`](https://github.com/TiankaiHang/Min-SNR-Diffusion-Training/blob/main/guided_diffusion/gaussian_diffusion.py#L69-L106) 에 *학습 loop 와 독립* 인 모듈 레벨 함수 `get_snr(steps=100)` 이 있음. cosine schedule 의 전체 SNR 곡선을 NumPy 로 한 번에 계산해 *주피터·플롯에서 미리 그려보는 용도*. 학습 시에는 안 쓰이고 디버깅·논문 figure 그릴 때만 사용.
+
+#### 논문 표기 ↔ 코드 매핑 (요약)
+
+| 논문 표기 | 코드 텐서·식 | 의미 |
+|---|---|---|
+| `α_t` | `sqrt_alphas_cumprod[t]` | 신호 계수 `√ᾱ_t` |
+| `σ_t` | `sqrt_one_minus_alphas_cumprod[t]` | 노이즈 계수 `√(1-ᾱ_t)` |
+| `SNR(t) = α_t² / σ_t²` | `(alpha / sigma) ** 2` | 시점 t 의 신호 대 잡음 비 |
+| `min(SNR, γ)` | `th.stack([snr, k*ones], 1).min(1)[0]` | Min-SNR-γ 위쪽 자르기 (line 859 / 884) |
+| `v = α_t ε − σ_t x₀` | `(alpha · x_t − x_start) / sigma` | velocity (line 851) |
+
 ```python
 # guided_diffusion/gaussian_diffusion.py (요지 발췌)
 alpha = _extract_into_tensor(self.sqrt_alphas_cumprod, t, t.shape)
@@ -269,6 +298,36 @@ x₀ 공간 (깨끗한 이미지 픽셀 기준) 으로 환산하면 ε-predictio
 ### Q6. 한 줄로: 무엇이 이 논문의 진짜 새로움인가?
 
 > "Parameterization 논쟁 (ε vs x₀ vs v 중 무엇을 예측해야 하나) 은 사실상 *가중치 논쟁* 이었고, 가중치를 `min(SNR, γ)` 로 위쪽만 잘라내기 (clamp) 만 해도 셋이 모두 비슷한 최적값에 도달한다" 는 **통합 관점** (unified view).
+
+### Q7. 그래서 *왜* Min-SNR-5 가 baseline 대비 3.4× 빠른가 — 메커니즘?
+
+§4.2 의 "3.4× 빠름" 은 *사실* 일 뿐. *왜* 그런지는 네 가지 효과가 결합된 결과:
+
+**1) Gradient 충돌 완화** (가장 본질적)
+- Diffusion 학습은 매 step 마다 *무작위로 뽑은 t 하나의 손실* 로 grad 를 계산하지만, 모델이 실제로 움직이는 방향은 *여러 step 평균* 의 결과 (= 모든 t 에 대한 gradient 의 가중합).
+- t=200 의 grad 와 t=900 의 grad 가 *반대 방향* 이면 합쳐졌을 때 서로 상쇄 → 합력 작음 → 같은 lr 로도 진전 작음.
+- §3.1 Fig 2 가 이걸 직접 실험으로 보임: "한 구간 학습 → 먼 구간 *나빠짐*" = zero-sum 충돌.
+- Min-SNR-γ 가 단계별 *상대 가중치를 균형* 잡으면 평균 grad 의 *방향 일관성* ↑ → 같은 step 으로 더 큰 실효 한 걸음 (effective step).
+
+**2) 두 극단 baseline 의 비효율** (어떤 baseline 과의 3.4× 인지 중요)
+- **constant** (= ε-pred 의 자연 가중치 1): low noise (이미 거의 깨끗) 의 픽셀 오차를 high noise 와 동등 비중으로 봄. low noise 는 빨리 *포화* (saturate) → 그 후 minibatch 의 t≈0 샘플들은 학습 진전에 거의 기여 안 함 ("공짜 빈 step").
+- **SNR weighting** (= x₀-pred 의 자연 가중치): 정반대. SNR 은 t→0 에서 ∞ 로 발산 → 한두 개의 저노이즈 샘플 loss 가 minibatch 평균을 압도 → high noise 학습이 묻혀 *low noise 만 잘하는 모델* 로 수렴.
+- **Min-SNR-γ**: γ=5 로 위쪽 자르기 (clamp) → 양쪽 모두에 일정 학습 신호 보장.
+- 논문의 3.4× 는 주로 **constant baseline 대비** FID=10 도달 step 수 비율 (Fig 5/6).
+
+**3) Variance reduction (분산 감소)**
+- 각 t 에서 나오는 gradient 의 노름이 t 마다 *수 자릿수* 차이 (low noise → 작은 손실, high noise → 큰 손실).
+- 이게 batch 단위 gradient 의 *분산* (variance) 을 키워 결과적으로 실효 학습률 (effective lr) 을 낮춤 — 큰 분산은 안정 학습을 위해 작은 lr 을 강요.
+- `min(SNR, γ)` 의 *위쪽 자르기* 가 가중치 극단값을 잘라내므로 batch grad 노름 분포가 좁아짐 → 분산 ↓ → 더 큰 실효 step ↑.
+
+**4) Task curriculum 효과** (보조)
+- high noise (어려운 과제) 는 학습이 느리고 low noise (쉬운 과제) 는 빨리 끝남.
+- Min-SNR-γ 는 학습 후반에도 high noise 의 비중을 *상대적으로 보호* → 모델이 어려운 부분을 계속 개선, curriculum (난이도 순서대로 가는 학습 흐름) 이 *끝나지 않고 지속*.
+
+**한 줄 직관**
+> "1000명이 줄을 같이 당기는데 그중 50명이 반대로 당기던 상태. Min-SNR-γ 는 반대로 당기던 사람들의 힘을 약하게 만든 것. 줄을 당기는 사람 수는 그대로인데 합력은 훨씬 강해짐."
+
+**주의** — 3.4× 는 *FID=10 도달 step 수* 기준의 비율. 최종 수렴값까지의 가속 배율은 더 작음. 다만 *같은 step 수로 더 낮은 FID* 라는 우열은 끝까지 유지 (Fig 5).
 
 ---
 
