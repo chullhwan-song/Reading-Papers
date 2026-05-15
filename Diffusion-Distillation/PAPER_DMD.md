@@ -92,7 +92,9 @@
 
 **원논문 Fig.2 — 전체 framework 한 장 요약**:
 
-![DMD Fig.2 framework](figures/dmd_fig2.png)
+<p align="center">
+  <img src="figures/dmd_fig2.png" alt="DMD Framework Overview (Fig. 2)" width="900"/>
+</p>
 
 *Source: Yin et al., "One-step Diffusion with Distribution Matching Distillation", CVPR 2024 (project page: tianweiy.github.io/dmd)*
 
