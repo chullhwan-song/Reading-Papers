@@ -104,11 +104,14 @@
 
 ### Fig.2 — 논문의 시각적 핵심
 
-![AsymFlow Fig.2](figures/asymflow_fig2.png)
+<p align="center">
+  <img src="figures/asymflow_fig2.png" alt="AsymFlow Parameterization and Recovery (Fig. 2)" width="900"/>
+</p>
+
+*Source: Chen et al., "Asymmetric Flow Models", arXiv:2605.12964 (2026), Fig. 2.*
 
 > **(좌) (a) Full-rank flow vs AsymFlow parameterization — 학습 타깃을 어떻게 바꿨나.**
 > **(우) (b) Converting asymmetric velocity to full-rank velocity — 바꾼 타깃을 어떻게 원래대로 합치나.**
-> 출처: 논문 Fig.2 (`figures/asym_param.pdf`).
 
 ### 3.1 Fig.2 (a) — 학습 타깃 단순화
 
@@ -257,7 +260,11 @@ P·u_A     = P·ε − P·x₀ = P·u           (부분공간 안 — 진짜 속
 
 ### 수렴 속도 비교 (`figures/epoch_fid.pdf`)
 
-![AsymFlow 수렴 속도 비교](figures/asymflow_epoch_fid.png)
+<p align="center">
+  <img src="figures/asymflow_epoch_fid.png" alt="AsymFlow vs JiT Convergence Speed" width="500"/>
+</p>
+
+*Source: Chen et al., "Asymmetric Flow Models", arXiv:2605.12964 (2026), Fig. on convergence speed comparison (unguided FIDs).*
 
 같은 백본·레시피에서 AsymFlow `r=8` 이 JiT `r=0` 대비 더 빨리 같은 FID 에 도달.
 
