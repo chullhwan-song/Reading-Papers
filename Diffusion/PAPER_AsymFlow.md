@@ -104,7 +104,7 @@
 
 ### Fig.2 — 논문의 시각적 핵심
 
-![AsymFlow Fig.2](asymflow_fig2.png)
+![AsymFlow Fig.2](figures/asymflow_fig2.png)
 
 > **(좌) (a) Full-rank flow vs AsymFlow parameterization — 학습 타깃을 어떻게 바꿨나.**
 > **(우) (b) Converting asymmetric velocity to full-rank velocity — 바꾼 타깃을 어떻게 원래대로 합치나.**
@@ -257,7 +257,7 @@ P·u_A     = P·ε − P·x₀ = P·u           (부분공간 안 — 진짜 속
 
 ### 수렴 속도 비교 (`figures/epoch_fid.pdf`)
 
-![AsymFlow 수렴 속도 비교](asymflow_epoch_fid.png)
+![AsymFlow 수렴 속도 비교](figures/asymflow_epoch_fid.png)
 
 같은 백본·레시피에서 AsymFlow `r=8` 이 JiT `r=0` 대비 더 빨리 같은 FID 에 도달.
 
