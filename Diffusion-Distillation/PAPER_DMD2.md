@@ -103,6 +103,14 @@
 
 > *왜 이 절을 두나*: 6요소가 어떻게 한 스텝 안에 결합되는지 한눈에 봐야 부분-전체 관계가 명확해짐.
 
+<p align="center">
+  <img src="figures/dmd2_fig3.png" alt="DMD2 Training Pipeline (Fig. 3)" width="900"/>
+</p>
+
+> **Fig. 3 — DMD2 학습 파이프라인.** 비싼 디퓨전 모델(회색, 오른쪽 = real score function)을 1-step 또는 multi-step 생성기(빨강 G_θ, 왼쪽)로 증류. 학습은 두 단계 번갈이 — **Step A** (G_θ 업데이트): 분포 매칭 그라디언트(빨강, real score − fake score) + GAN loss(녹색)로 학생을 진짜 분포 쪽으로 밀어줌. **Step B** (보조 네트워크 업데이트): fake score function(파랑)은 학생의 현재 출력 분포를 추적하도록 diffusion loss로 학습, discriminator(녹색)는 fake/real을 구분하도록 GAN loss로 학습.
+>
+> 핵심 색깔: 🔴 학생·분포 매칭 그라디언트 / ⚪ 선생(고정) / 🔵 fake score function / 🟢 GAN discriminator + real data. **L_reg 는 그림에 없음** — DMD2 의 가장 큰 변화 ([[paper_dmd]] 와 비교 시).
+
 ```
 ┌─ Real image (LAION VAE latents, LMDB) ─────────────────┐
 │                                                        │
