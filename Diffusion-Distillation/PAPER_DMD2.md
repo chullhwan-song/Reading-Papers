@@ -669,7 +669,47 @@ for step in training:
 
 ## 13. DMD2 학습 흐름을 한 번에 보기
 
-전체를 한 장으로 줄이면 다음과 같습니다.
+논문 Figure 3가 DMD2 학습 구조를 가장 잘 보여줍니다.
+
+<p align="center">
+  <img src="figures/dmd2_fig3.png" alt="DMD2 training pipeline" width="900"/>
+</p>
+
+그림을 읽을 때는 네 부분만 보면 됩니다.
+
+1. **왼쪽 빨간 모델 = student generator `G_θ`**  
+   Noise 또는 noisy latent를 받아 빠르게 image latent `x̂₀`를 만듭니다. 우리가 최종적으로 배포하고 싶은 모델입니다.
+
+2. **오른쪽 회색 모델 = frozen teacher / real score function**  
+   이미 학습된 diffusion teacher입니다. 학습 중에는 고정되어 있고, student 출력이 real/teacher 분포 쪽으로 가려면 어떤 방향이 좋은지 알려줍니다.
+
+3. **아래쪽 파란 모델 = fake score function, 즉 critic `μ_fake`**  
+   현재 student가 만드는 이미지 분포 `p_fake_θ`를 따라가며, student 분포의 score를 추정합니다. DMD2에서는 이 critic을 generator보다 더 자주 학습합니다. 이것이 TTUR입니다.
+
+4. **초록색 GAN branch = real-data GAN loss**  
+   Teacher score만 믿지 않고 real image와 student image를 직접 비교합니다. 이 신호 덕분에 student가 teacher의 한계를 일부 넘을 수 있습니다.
+
+그림의 학습은 크게 두 턴으로 돌아갑니다.
+
+```text
+Turn A. Generator update
+  student가 fake image를 만듦
+  -> teacher score와 fake score 차이로 distribution matching loss 계산
+  -> GAN branch가 "fake가 real처럼 보이게" generator loss 제공
+  -> student G_θ 업데이트
+
+Turn B. Critic / discriminator update
+  student image는 detach해서 사용
+  -> μ_fake가 student 분포의 score를 더 잘 추정하도록 denoising loss 학습
+  -> GAN branch가 real/fake를 구분하도록 classification loss 학습
+  -> critic μ_fake와 GAN head 업데이트
+```
+
+즉, Figure 3는 아래 문장을 그림으로 표현한 것입니다.
+
+> **DMD2는 student를 업데이트할 때 teacher score, fake score, real-data GAN signal을 함께 쓰고, critic은 student 분포를 계속 따라잡도록 더 자주 학습한다.**
+
+텍스트로 더 단순화하면 다음과 같습니다.
 
 ```text
                  real image
