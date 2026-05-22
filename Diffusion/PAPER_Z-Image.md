@@ -1140,15 +1140,15 @@ BM25 기반 rarity balancing, model merging 같은 구성 원리는 설명한다
 
 Z-Image SFT 데이터와 완전히 같은 수준의 내부 curated dataset이 공개된 것은 아니지만, **비슷한 목적의 공개 데이터셋**은 있습니다.
 
-| 데이터셋 | 공개 여부 | 규모 | Z-Image SFT와의 유사도 | 장점 | 주의점 |
-|---|---:|---:|---|---|---|
-| **Fine-T2I** | 공개 | 6M+ pair, 약 2TB | 매우 높음 | T2I fine-tuning용 대규모 고품질 curated 데이터. Z-Image/FLUX2 등으로 만든 synthetic data + 전문 사진 기반 real data 포함. original/enhanced prompt 제공 | synthetic 비중이 큼. Z-Image가 의도적으로 피한 proprietary/synthetic distillation 계열과 철학이 다를 수 있음 |
-| **Alchemist** | 공개 | 3,350 samples | 매우 높음 | 작지만 SFT 효과를 노린 초고품질 curated 데이터. diffusion model 내부 activation으로 좋은 SFT 샘플을 고르고 VLM recaption 사용 | 규모가 작음. 대규모 general model 학습보다는 SFT 효과 검증/소규모 개선에 가까움 |
-| **LAION-Aesthetics** | 공개 | score threshold별 수백만~억 단위 | 중간 | aesthetic score 기반 공개 image-text pool. LAION-Art(score > 8), LAION-Aesthetic(score > 7) 등으로 필터링 가능 | caption 품질과 alignment가 Z-Image식 SFT 데이터보다 거칠다. 추가 filtering/recaptioning 필요 |
-| **JourneyDB** | 공개 | 4M generated image-prompt | 중간 | 고품질 generated image와 prompt 쌍. style/prompt 연구와 generated image understanding에 유용 | 원래 목적은 T2I SFT라기보다 benchmark/understanding 쪽. 생성 모델 편향이 들어 있음 |
-| **DiffusionDB** | 공개 | 14M image-prompt | 낮음~중간 | Stable Diffusion Discord 기반 대규모 real user prompt-image 로그. CC0로 설명됨 | 고품질 curated SFT 데이터가 아니라 사용 로그에 가깝다. 노이즈, 편향, prompt 품질 차이가 큼 |
-| **ShareGPT4V** | 공개 | 100K GPT-4V captions / 1.2M generated captions | 보조적으로 높음 | 매우 자세한 image caption 데이터. object property, spatial relation, world knowledge, aesthetic description 포함 | T2I SFT용 image-prompt pair라기보다 captioner/LMM 학습용. 원천 이미지와 라이선스 확인 필요 |
-| **SFHQ-T2I** | 공개 | 122K face image-prompt | 도메인 한정 | 고품질 1024x1024 synthetic face image와 prompt. 얼굴 도메인에서는 품질과 다양성이 좋음 | 얼굴 전용이라 general T2I SFT에는 좁다. 여러 생성 모델로 만든 synthetic 데이터 |
+| 데이터셋 | 실제 데이터 링크 | 공개 여부 | 규모 | Z-Image SFT와의 유사도 | 장점 | 주의점 |
+|---|---|---:|---:|---|---|---|
+| **Fine-T2I** | [HF dataset](https://huggingface.co/datasets/ma-xu/fine-t2i), [arXiv](https://arxiv.org/abs/2602.09439) | 공개 | 6M+ pair, 약 2TB | 매우 높음 | T2I fine-tuning용 대규모 고품질 curated 데이터. Z-Image/FLUX2 등으로 만든 synthetic data + 전문 사진 기반 real data 포함. original/enhanced prompt 제공 | synthetic 비중이 큼. Z-Image가 의도적으로 피한 proprietary/synthetic distillation 계열과 철학이 다를 수 있음 |
+| **Alchemist** | [HF dataset](https://huggingface.co/datasets/yandex/alchemist), [paper](https://arxiv.org/abs/2505.19297) | 공개 | 3,350 samples | 매우 높음 | 작지만 SFT 효과를 노린 초고품질 curated 데이터. diffusion model 내부 activation으로 좋은 SFT 샘플을 고르고 VLM recaption 사용 | 규모가 작음. 대규모 general model 학습보다는 SFT 효과 검증/소규모 개선에 가까움 |
+| **LAION-Aesthetics** | [dataset page](https://projects.laion.ai/laion-datasets/laion-aesthetic.html), [LAION datasets](https://projects.laion.ai/laion-datasets/) | 공개 | score threshold별 수백만~억 단위 | 중간 | aesthetic score 기반 공개 image-text pool. LAION-Art(score > 8), LAION-Aesthetic(score > 7) 등으로 필터링 가능 | caption 품질과 alignment가 Z-Image식 SFT 데이터보다 거칠다. 추가 filtering/recaptioning 필요 |
+| **JourneyDB** | [official repo](https://github.com/JourneyDB/JourneyDB), [HF mirror](https://huggingface.co/datasets/bitmind/JourneyDB), [arXiv](https://arxiv.org/abs/2307.00716) | 공개 | 4M generated image-prompt | 중간 | 고품질 generated image와 prompt 쌍. style/prompt 연구와 generated image understanding에 유용 | 공식 데이터는 Terms of Usage와 신청 폼 기반. HF mirror는 일부 mirror일 수 있음. 생성 모델 편향이 들어 있음 |
+| **DiffusionDB** | [HF dataset](https://huggingface.co/datasets/poloclub/diffusiondb), [project page](https://anonacl.github.io/diffusiondb/), [arXiv](https://arxiv.org/abs/2210.14896) | 공개 | 14M image-prompt | 낮음~중간 | Stable Diffusion Discord 기반 대규모 real user prompt-image 로그. CC0로 설명됨 | 고품질 curated SFT 데이터가 아니라 사용 로그에 가깝다. 노이즈, 편향, prompt 품질 차이가 큼 |
+| **ShareGPT4V** | [project/data page](https://sharegpt4v.github.io/), [HF org](https://huggingface.co/Lin-Chen) | 공개 | 100K GPT-4V captions / 1.2M generated captions | 보조적으로 높음 | 매우 자세한 image caption 데이터. object property, spatial relation, world knowledge, aesthetic description 포함 | T2I SFT용 image-prompt pair라기보다 captioner/LMM 학습용. 원천 이미지와 라이선스 확인 필요 |
+| **SFHQ-T2I** | [GitHub](https://github.com/SelfishGene/SFHQ-T2I-dataset), [Kaggle](https://www.kaggle.com/datasets/selfishgene/sfhq-t2i-synthetic-faces-from-text-2-image-models) | 공개 | 122K face image-prompt | 도메인 한정 | 고품질 1024x1024 synthetic face image와 prompt. 얼굴 도메인에서는 품질과 다양성이 좋음 | 얼굴 전용이라 general T2I SFT에는 좁다. 여러 생성 모델로 만든 synthetic 데이터 |
 
 가장 가까운 공개 대안만 고르면:
 
