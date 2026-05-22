@@ -101,9 +101,11 @@ student가 만든 이미지들의 분포 ~= teacher 또는 real image 분포
 
 ## 4. 등장인물 정리
 
-### 4.1 Student, `G_theta`
+### 4.1 Student, `G_θ`
 
 Student는 빠른 생성기입니다.
+
+논문에서는 student generator를 보통 **`G_θ`**로 씁니다. 여기서 **`θ`는 student 신경망의 학습 파라미터**, 즉 weights를 뜻합니다.
 
 입력:
 
@@ -114,13 +116,13 @@ noise 또는 noisy latent + timestep + text condition
 출력:
 
 ```text
-clean image latent, 즉 x0 예측
+clean image latent, 즉 `x₀` 예측
 ```
 
-DMD2의 multi-step student는 일반 diffusion sampler처럼 "노이즈를 조금 줄인 다음 상태"를 출력하지 않습니다. **현재 noisy input에서 바로 clean image `x0`를 예측**합니다.
+DMD2의 multi-step student는 일반 diffusion sampler처럼 "노이즈를 조금 줄인 다음 상태"를 출력하지 않습니다. **현재 noisy input에서 바로 clean image `x₀`를 예측**합니다.
 
 ```text
-G_theta(x_t, t) -> x0_hat
+G_θ(x_t, t) -> x̂₀
 ```
 
 이 구조 때문에 DMD2는 LCM/LCMScheduler와 잘 맞습니다.
@@ -137,7 +139,7 @@ Teacher는 이미 학습된 diffusion 모델입니다.
 
 Teacher는 학습 중 고정됩니다. 코드에서는 `real_unet`으로 등장합니다.
 
-### 4.3 Critic, `fake_unet` 또는 `mu_fake`
+### 4.3 Critic, `fake_unet` 또는 `μ_fake`
 
 DMD2에서 가장 헷갈리는 대상이 critic입니다.
 
@@ -172,26 +174,26 @@ student update direction ~= s_fake - s_real
  teacher/real 분포가 좋아하는 곳으로 이동하라."
 ```
 
-### 4.4 `p_fake_theta`는 한 장의 이미지가 아니다
+### 4.4 `p_fake_θ`는 한 장의 이미지가 아니다
 
-`p_fake_theta`는 student가 만든 한 장의 이미지가 아닙니다.
+`p_fake_θ`는 student가 만든 한 장의 이미지가 아닙니다.
 
 정확히는:
 
-> **현재 student `G_theta`에 여러 noise를 넣었을 때 나오는 모든 이미지들의 분포**
+> **현재 student `G_θ`에 여러 noise를 넣었을 때 나오는 모든 이미지들의 분포**
 
 예를 들어 noise를 100만 개 뽑아서 student에 넣는다고 생각합니다.
 
 ```text
-z1 -> G_theta -> dog-like image
-z2 -> G_theta -> cat-like image
-z3 -> G_theta -> blurry image
+z1 -> G_θ -> dog-like image
+z2 -> G_θ -> cat-like image
+z3 -> G_θ -> blurry image
 ...
 ```
 
-이 출력들이 이미지 공간 어디에 얼마나 모이는지의 패턴이 `p_fake_theta`입니다.
+이 출력들이 이미지 공간 어디에 얼마나 모이는지의 패턴이 `p_fake_θ`입니다.
 
-학습이 진행되면 student의 가중치 `theta`가 바뀌므로 `p_fake_theta`도 매 step 조금씩 바뀝니다. 그래서 critic은 계속 현재 student 분포를 따라잡아야 합니다.
+학습이 진행되면 student의 가중치 `θ`가 바뀌므로 `p_fake_θ`도 매 step 조금씩 바뀝니다. 그래서 critic은 계속 현재 student 분포를 따라잡아야 합니다.
 
 ---
 
@@ -230,7 +232,7 @@ DMD 원작은 분포 매칭만으로 학습하면 불안정해질 수 있어서 
 > **같은 noise에서 teacher가 50-step으로 만든 정답 이미지와 student의 1-step 출력을 MSE로 맞추는 손실**
 
 ```text
-L_reg = || G_theta(z) - teacher_output(z) ||^2
+L_reg = || G_θ(z) - teacher_output(z) ||^2
 ```
 
 이 손실은 안정성에는 도움이 됩니다. 하지만 큰 문제가 있습니다.
@@ -481,10 +483,10 @@ pure noise -> 완성 이미지
 DMD2는 SDXL 같은 큰 모델에서는 4-step generator를 사용합니다.
 
 ```text
-t = 999 -> student -> x0_hat -> 다시 noise 추가, t = 749
-t = 749 -> student -> x0_hat -> 다시 noise 추가, t = 499
-t = 499 -> student -> x0_hat -> 다시 noise 추가, t = 249
-t = 249 -> student -> 최종 x0_hat
+t = 999 -> student -> x̂₀ -> 다시 noise 추가, t = 749
+t = 749 -> student -> x̂₀ -> 다시 noise 추가, t = 499
+t = 499 -> student -> x̂₀ -> 다시 noise 추가, t = 249
+t = 249 -> student -> 최종 x̂₀
 ```
 
 코드와 README에서 쓰는 timestep:
@@ -505,8 +507,8 @@ reverse step으로 x_{t-1} 계산
 DMD2 multi-step:
 
 ```text
-(x_t, t) -> x0_hat
-x0_hat에 forward noising을 다시 적용해서 다음 timestep 입력 생성
+(x_t, t) -> x̂₀
+x̂₀에 forward noising을 다시 적용해서 다음 timestep 입력 생성
 ```
 
 즉, step 간 이동은 학습된 reverse solver가 아니라 단순 forward noising 공식으로 합니다.
@@ -892,7 +894,7 @@ DMD2를 이해할 때 가장 중요한 문장은 이것입니다.
 | Real-data GAN loss | teacher만 보지 말고 진짜 이미지도 본다 |
 | Multi-step generator | 한 번에 만들기 어려우니 4번에 나눠 만든다 |
 | Backward simulation | 추론 중간 상태를 학습 때도 경험하게 한다 |
-| LCMScheduler 호환 | `(x_t,t) -> x0` consistency-style이라 배포가 쉽다 |
+| LCMScheduler 호환 | `(x_t,t) -> x̂₀` consistency-style이라 배포가 쉽다 |
 
 결과적으로 DMD2는 SDXL 같은 큰 text-to-image 모델을 4-step으로 빠르게 만들면서도 teacher에 가까운 품질을 유지하는 실용적인 distillation 프레임입니다.
 
