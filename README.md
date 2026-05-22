@@ -24,4 +24,4 @@
 | No | Title | Venue | Paper | Code | Updated |
 |---|---|---|---|---|---|
 | 2 | [Improved Distribution Matching Distillation for Fast Image Synthesis](Diffusion-Distillation/PAPER_DMD2.md) | NeurIPS 2024 | [arxiv](https://arxiv.org/abs/2405.14867) | [github](https://github.com/tianweiy/dmd2) | 2026-05-22 |
-| 1 | [One-step Diffusion with Distribution Matching Distillation](Diffusion-Distillation/PAPER_DMD.md) | CVPR 2024 | [arxiv](https://arxiv.org/abs/2311.18828) | - | 2026-05-15 |
+| 1 | [One-step Diffusion with Distribution Matching Distillation](Diffusion-Distillation/PAPER_DMD.md) | CVPR 2024 | [arxiv](https://arxiv.org/abs/2311.18828) | - | 2026-05-22 |
