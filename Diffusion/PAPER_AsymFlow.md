@@ -1,112 +1,357 @@
-# PAPER: AsymFlow — 노이즈 항만 저랭크로 압축해 픽셀 공간 flow matching을 부활시킨 파라미터화
+# PAPER: AsymFlow - 픽셀 공간 Flow Matching 쉽게 읽기
 
-## 📌 메타 정보
+## 0. 이 문서를 읽는 법
+
+이 문서는 **Asymmetric Flow Models** 논문과 공개 코드(`configs/asymflow/`)를 보고, 처음 읽는 사람이 흐름을 놓치지 않도록 다시 정리한 리뷰입니다.
+
+핵심 목표는 하나입니다.
+
+> **AsymFlow는 픽셀 공간 flow matching이 어려웠던 이유를 "노이즈 정답이 너무 고차원이라서"라고 보고, 학습 정답의 노이즈 부분만 저랭크로 줄여 픽셀 모델을 다시 강하게 만드는 방법이다.**
+
+DMD/DMD2 문서와 같이 읽는다면 이렇게 보면 좋습니다.
+
+```text
+DMD/DMD2   = 느린 diffusion teacher를 빠른 student로 증류하는 방법
+AsymFlow   = flow matching의 학습 타깃 자체를 더 배우기 쉽게 바꾸는 방법
+```
+
+이 문서는 아래 순서로 읽으면 편합니다.
+
+1. AsymFlow가 해결하려는 문제
+2. Flow Matching 기본 기호: `x_0`, `epsilon`, `x_t`, `u`
+3. 핵심 아이디어: `u = epsilon - x_0`를 `u_A = P epsilon - x_0`로 바꾸기
+4. `P`가 무엇인지: PCA 기반 저랭크 사영
+5. 왜 다시 full velocity로 복원해야 하는지
+6. ImageNet scratch 학습과 FLUX pixel finetune
+7. 실험 결과와 FAQ
+
+---
+
+## 1. 메타 정보
 
 | 항목 | 내용 |
 |---|---|
-| **논문 제목** | Asymmetric Flow Models |
-| **저자** | Hansheng Chen, Jan Ackermann, Minseo Kim, Gordon Wetzstein, Leonidas Guibas (Stanford 외) |
-| **공개일** | 2026-05-13 (arXiv v1) |
-| **분야** | 이미지 생성 / Flow Matching / cs.CV |
-| **논문 링크** | https://arxiv.org/abs/2605.12964 |
-| **공식 코드** | https://github.com/Lakonik/LakonLab (`configs/asymflow/`) |
-| **사용한 외부 모델** | FLUX.2 klein Base 9B (Black Forest Labs), Qwen2.5-VL (캡션 생성) |
-| **데이터** | ImageNet-256 (scratch), LAION-Aesthetics 3M (T2I 미세조정) |
-| **본 문서 목적** | AsymFlow 파라미터화·복원 공식·PCA/Procrustes 사영·미세조정 절차를 한 페이지로 정리 |
-
-### 위치 짚기 (왜 이 논문이 중요한가)
-
-- **1저자 Hansheng Chen의 flow matching 3연작 중 가장 임팩트 큰 결과** — GMFlow (ICML 2025, 출력 분포를 Gaussian Mixture로) → π-Flow (ICLR 2026, policy 기반 few-step distillation) → AsymFlow (2026, 노이즈만 저랭크 사영). 세 편 모두 "flow matching의 표현·파라미터화를 손본다"는 일관된 라인.
-- **"latent 공간 모델이 픽셀 공간 모델보다 무조건 우월하다"는 통념을 뒤집은 첫 결과 중 하나** — JiT-H/16 픽셀 모델로 FID 1.57 달성, latent 기반 DiT-XL/RAE(1.50)와 동급, REPA-XL/2(1.38)에 근접.
-- **Pretrained latent flow → pixel space 첫 미세조정 방법** — FLUX.2 klein 9B를 LoRA + Procrustes alignment + Oklab 정규화 조합으로 픽셀 버전(AsymFLUX.2 klein)으로 옮김.
-- **[[paper_min_snr]]·[[paper_lumina_next]] 와 같은 "한 군데만 손대는 minimal trick" 계열** — 네트워크 구조·옵티마이저·스케줄러 한 줄도 안 바뀜.
+| 논문 | Asymmetric Flow Models |
+| 저자 | Hansheng Chen, Jan Ackermann, Minseo Kim, Gordon Wetzstein, Leonidas Guibas |
+| 공개일 | 2026-05-13, arXiv v1 |
+| arXiv | https://arxiv.org/abs/2605.12964 |
+| 공식 코드 | https://github.com/Lakonik/LakonLab (`configs/asymflow/`) |
+| 분야 | 이미지 생성, Flow Matching, 픽셀 공간 생성 모델 |
+| 주요 실험 | ImageNet-256 scratch 학습, FLUX.2 klein pixel-space finetune |
+| 외부 모델 | FLUX.2 klein Base 9B, Qwen2.5-VL recaptioning |
+| 데이터 | ImageNet-256, LAION-Aesthetics 3M subset |
 
 ---
 
-## 📖 주요 용어 사전 (Glossary)
+## 2. 한 문장 요약
 
-### Flow matching 기본 (이 논문이 가정하는 배경)
+> **AsymFlow는 flow matching의 정답 velocity에서 데이터 항 `-x_0`는 그대로 두고, 노이즈 항 `epsilon`만 `P epsilon`으로 저랭크 사영해서 네트워크가 쓸데없는 풀랭크 랜덤 노이즈를 배우지 않게 만드는 방법이다.**
 
-- **Flow matching**: 깨끗한 데이터 `x₀` 와 노이즈 `ε` 사이를 직선으로 보간하는 시간 t 의 경로를 따라 *속도 (velocity)* 를 학습하는 생성 방식. Stable Diffusion 3, FLUX, Lumina-Next 등이 채택.
-- **보간식 (interpolant)**: `x_t = (1−t)·x₀ + t·ε` — 진짜 데이터와 가우시안 노이즈를 `t` 비율로 섞은 중간 상태.
-- **속도 u (velocity)**: 정답으로 학습하는 시간 도함수. `u = ε − x₀` (rectified flow / linear interpolant 기준).
-- **노이즈 강도 σ_t**: 시점 `t` 에서의 노이즈 비중 (rectified flow 에선 `σ_t = t`).
-- **u-prediction**: 네트워크가 속도 `u` 를 직접 예측. 표준 flow matching.
-- **x₀-prediction**: 네트워크가 깨끗한 데이터 `x₀` 자체를 예측. 옛 DDPM 계열.
+조금 더 쉽게 말하면:
 
-### AsymFlow 핵심 (본 논문의 신규 개념)
+> **기존 픽셀 flow model은 이미지 자체를 배우는 동시에, 모든 픽셀 방향의 무작위 노이즈까지 정답처럼 맞춰야 했다. AsymFlow는 "이미지에 의미 있는 주요 방향의 노이즈만 남기자"라고 정답을 바꾼다.**
 
-- **비대칭 속도 (asymmetric velocity, u_A)**: AsymFlow 의 새 학습 타깃. `u_A = P·ε − x₀`. 노이즈 항만 저랭크 사영을 거치고 데이터 항은 그대로.
-- **저랭크 사영기 (low-rank projector, P)**: `P = A·Aᵀ`. `A ∈ ℝ^(D×r)` 는 정규직교 기저 (orthonormal basis, `AᵀA = I_r`). `P` 의 상 (image) `Im(P)` 는 r 차원 부분공간, `I−P` 의 상은 그 직교 여집합 (orthogonal complement).
-- **저랭크 노이즈 (low-rank noise)**: `P·ε`. 원래 D차원 무작위 벡터인 `ε` 를 r 개 주성분 방향으로만 떨어뜨린 것.
-- **패치별 사영 (patch-wise projection)**: 같은 `A` 를 모든 patch 토큰에 공유 적용. patch 차원 `D` 안에서만 저랭크 압축, 토큰 수는 그대로.
-- **랭크 r (rank)**: 부분공간 차원. ImageNet (JiT-H/16) 에서 `r=8`, AsymFLUX.2 klein 에서 `r=128`.
-- **PCA basis (scratch 학습용 A 만드는 법)**: 학습 데이터셋의 patch 들에 PCA (Principal Component Analysis, 주성분 분석) 를 돌려 상위 `r` 개 방향을 `A` 로 사용.
-- **Procrustes alignment (미세조정용 A 만드는 법)**: latent 변수와 대응하는 pixel patch 사이의 *직교 회전 최적 매칭* (orthogonal Procrustes problem — 두 점 집합을 직교 변환으로 가장 잘 맞추는 문제) 으로 `A` 계산. latent → pixel 초기화를 매끄럽게 함.
-- **복원 공식 (full-rank velocity recovery)**: 네트워크 출력 `û_A` 로부터 진짜 속도 `û` 를 만드는 항등식. `û = P·û_A + (I−P)·(x_t + û_A)/σ_t`.
+가장 중요한 식은 두 개입니다.
 
-### AsymFLUX.2 klein 미세조정 관련
+```math
+u = \epsilon - x_0
+```
 
-- **Oklab color space**: perceptually uniform 한 색공간 (perceptual = 사람 눈이 느끼는 색 차이가 좌표 거리와 비례). VAE 를 떼는 대신 픽셀을 Oklab 으로 변환해 학습 분포를 정규화 (mean=(0.56, 0, 0.01), std=0.16).
-- **LoRA (Low-Rank Adaptation)**: 사전학습 가중치 `W` 를 고정한 채 `ΔW = B·A` (rank 256) 형태의 어댑터만 학습. AsymFlow 의 P 사영과 *이름은 비슷하지만 완전히 다른 자리* — LoRA 는 가중치 측, P 는 데이터/노이즈 측.
-- **APG (Adaptive Projected Guidance)**: classifier-free guidance 의 직교 사영 변형. AsymFLUX.2 klein 샘플링 시 UniPC 솔버와 함께 사용.
-- **UniPC (Unified Predictor-Corrector)**: 적은 step 으로 ODE 를 풀기 위한 고차 솔버. 추론 38 step.
+```math
+u_A = P\epsilon - x_0
+```
 
-### 비교 기법·평가
+여기서 `u`는 기존 flow matching의 정답 velocity이고, `u_A`는 AsymFlow의 새 정답입니다. 차이는 딱 하나입니다.
 
-- **JiT (Just image Transformer)**: 본 논문 1저자 그룹의 픽셀 공간 ViT 기반 디퓨전 백본. AsymFlow scratch 실험의 베이스. H/16 = Huge + patch size 16.
-- **REPA (REPresentation Alignment) loss**: DINOv2 등 자기지도학습 특징과 디퓨전 내부 특징을 정렬하는 보조 손실. ImageNet 1.57 FID 달성 시 사용.
-- **DiT-XL/RAE / REPA-XL**: 본 논문에서 비교한 latent 기반 baseline. 픽셀 모델이 이를 넘어서는 게 핵심 메시지.
-- **FID / HPSv3 / DPG-Bench / GenEval**: 평가 지표. FID (이미지 분포 거리), HPSv3 (인간 선호), DPG-Bench·GenEval (지시이행 정확도).
-
-### 부록: 본문에서 자주 등장하는 추상 용어
-
-- **사영 (projection)**: 벡터를 특정 부분공간으로 떨어뜨리는 선형 연산. `P` 는 멱등 (`P² = P`) + 대칭 (`Pᵀ = P`).
-- **직교 여집합 (orthogonal complement)**: 어떤 부분공간 `V` 와 *수직인 모든 벡터*의 집합. `Im(I−P)` 가 그것. 두 공간을 더하면 전체 공간 복원.
-- **Rank (랭크)**: 부분공간 차원, 행렬의 독립 열/행 개수.
-- **Full-rank (풀랭크)**: 차원이 최대 (`D` 전체) 인 상태.
+```text
+기존:      epsilon 전체를 정답에 넣음
+AsymFlow: P epsilon, 즉 중요한 r개 방향의 noise만 정답에 넣음
+```
 
 ---
 
-## 1️⃣ 논문 한눈에 보기 (TL;DR)
+## 3. AsymFlow가 해결하려는 문제
 
-> **픽셀 공간 모델이 latent 공간 모델보다 늘 뒤졌던 이유** — 이미지를 압축하지 않고 원본 RGB 픽셀 그대로 (픽셀 공간) 다루면, 네트워크는 256×256×3 ≈ 약 20만 픽셀 각각에 흩뿌려진 *무작위 잡음 한 장 전체* 를 빠짐없이 예측해야 한다 (이걸 *풀랭크 노이즈 모델링* 이라 한다). 그런데 실제로 의미 있는 이미지 변화는 *수십~수백 방향* 이면 충분 (저랭크). 즉 네트워크가 쓸데없는 무작위 방향까지 다 외우느라 *모델 용량을 낭비* 하고 있던 것. 반대로 latent 공간 모델은 VAE 로 이미지를 한 번 작게 압축한 공간에서 작업해서 이 부담이 자연스럽게 줄어든다.
->
-> **AsymFlow 가 바꾼 것** — 네트워크에게 보여주는 *정답* 에서 노이즈 부분만 주요 변동축 `r` 개로 압축. 식으로 보면 기존 정답 `u = ε − x₀` (= 노이즈 한 장 빼기 원본 이미지) 를 `u_A = P·ε − x₀` 로 바꾼다. 여기서 `P` 는 r 개 주성분 (PCA basis) 외의 방향을 깎아내는 *저랭크 사영기* (ImageNet 에선 `r=8`, FLUX 픽셀 미세조정에선 `r=128`). 즉 *"노이즈를 r 개 주요 방향 안에서만 그려라"* 는 제약. 데이터 항 (`x₀`) 은 그대로 풀랭크 유지. 진짜 속도는 `û = P·û_A + (I−P)·(x_t + û_A)/σ_t` 라는 항등식으로 분석적 복원 — 네트워크·옵티마이저·샘플러 한 줄 안 바꿈. **ImageNet 256 FID 1.57** (JiT-H/16 + REPA), FLUX.2 klein 9B 픽셀 미세조정으로 T2I 벤치 (HPSv3/DPG/GenEval) SOTA.
+### 3.1 왜 픽셀 공간 모델이 어려운가
 
-**핵심 문제** — 픽셀 공간 (예: 256×256×3 = 196,608 차원) 에서 직접 flow matching 을 돌리면 왜 잘 안 되나?
+이미지를 latent 공간이 아니라 픽셀 공간에서 바로 다룬다고 생각합니다.
 
-→ 네트워크가 *학습 정답에 포함된 무작위 노이즈* 를 픽셀 단위로 다 예측해야 함. 데이터 매니폴드는 사실상 저랭크인데 (수십~수백 방향이면 충분) 노이즈는 풀랭크라 capacity 낭비.
+예를 들어 256x256 RGB 이미지는 차원이 이만큼 큽니다.
 
-**해결책** — 3 단계:
+```text
+256 x 256 x 3 = 196,608 차원
+```
 
-1. **타깃 단순화** (Fig.2 (a))**: `u_A = P·ε − x₀`. 노이즈 항을 r 차원 부분공간으로 사영. 데이터 항은 풀랭크 유지.
-2. **항등식 복원** (Fig.2 (b))**: 학습/샘플링 시 `û_A` 를 두 직교 성분으로 분해 → 부분공간 안쪽은 그대로 사용, 바깥쪽은 `x₀` 스타일 → 속도 스타일로 환산 후 합산.
-3. **A 행렬 두 가지 구성법**: scratch 학습에선 데이터 patch 의 PCA, 사전학습 latent 모델 미세조정에선 latent ↔ pixel Procrustes alignment.
+Flow matching은 깨끗한 이미지 `x_0`와 랜덤 노이즈 `epsilon` 사이를 잇는 경로를 학습합니다.
 
-**검증**:
-- ImageNet 256×256: JiT-H/16 + AsymFlow (`r=8`) → **FID 1.76**, +REPA → **FID 1.57**
-- T2I: FLUX.2 klein 9B → AsymFLUX.2 klein (`r=128`, LoRA rank-256, 32 GPU × 20K iter) → HPSv3/DPG-Bench/GenEval 모두 동급 latent baseline 상회
-- ImageNet 실험은 **LoRA 없이 from-scratch 풀학습** — 1.57 FID 가 순수 파라미터화 트릭 + REPA 의 효과임을 증명
+```text
+clean image x_0
+      |
+      |  중간 상태 x_t
+      v
+random noise epsilon
+```
+
+기존 정답 velocity는 다음입니다.
+
+```math
+u = \epsilon - x_0
+```
+
+문제는 `epsilon`입니다.
+
+`epsilon`은 이미지와 달리 의미 있는 구조가 없습니다. 그냥 모든 픽셀 방향에 흩뿌려진 랜덤 노이즈입니다. 픽셀 공간에서는 이 랜덤 노이즈가 거의 20만 차원짜리 정답으로 들어갑니다.
+
+그래서 네트워크 입장에서는 이런 일을 해야 합니다.
+
+```text
+해야 하는 일 1: 이미지의 의미 있는 구조 배우기
+해야 하는 일 2: 모든 픽셀 방향의 랜덤 노이즈까지 정답처럼 맞추기
+```
+
+AsymFlow의 관점은 단순합니다.
+
+> **2번은 너무 낭비다. 이미지가 실제로 많이 변하는 주요 방향만 남기고, 나머지 랜덤 노이즈는 정답에서 빼자.**
+
+### 3.2 latent 모델이 유리했던 이유
+
+Stable Diffusion이나 FLUX 같은 모델은 보통 VAE로 이미지를 latent로 압축한 뒤 diffusion/flow를 돌립니다.
+
+```text
+pixel image -> VAE encoder -> compact latent
+```
+
+latent 공간은 픽셀보다 훨씬 작고, 이미 어느 정도 압축되어 있습니다. 그래서 풀랭크 픽셀 노이즈를 직접 맞추는 부담이 줄어듭니다.
+
+AsymFlow는 이 점을 다르게 해석합니다.
+
+```text
+latent가 좋은 이유:
+  이미지 정보를 압축해서 노이즈 예측 부담이 줄어든다
+
+AsymFlow의 질문:
+  그러면 픽셀 공간에서도 노이즈 정답만 압축하면 되지 않을까?
+```
+
+이 질문에서 논문 전체가 시작됩니다.
 
 ---
 
-## 2️⃣ 핵심 기여 (Contributions)
+## 4. Flow Matching 기본 기호
 
-1. **Rank-asymmetric velocity parameterization** — `u_A = P·ε − x₀`. 학습 타깃의 두 항 (데이터 / 노이즈) 을 *비대칭으로* 다루는 첫 파라미터화.
-2. **부분공간 / 직교 여집합 분해 + 분석적 복원 공식** — `P·u_A = P·u` (부분공간 안에선 진짜 속도), `(I−P)·u_A = −(I−P)·x₀` (바깥쪽에선 데이터 예측) 항등식으로 `û` 복원이 한 줄.
-3. **랭크 r 의 family 해석** — `r=0` → x₀-prediction, `r=D` → u-prediction, 그 사이 sweet spot 존재. 기존 두 파라미터화를 잇는 통합 시야.
-4. **PCA vs Procrustes 두 가지 A 구성법** — scratch (PCA) 와 미세조정 (latent-pixel Procrustes) 시나리오 모두 커버.
-5. **사전학습 latent flow → pixel space 첫 미세조정 방법** — FLUX.2 klein 9B 본체 frozen + 입출력 projection + rank-256 LoRA + Oklab 정규화 조합.
-6. **픽셀 공간 flow matching 의 SOTA 복귀** — ImageNet 256×256 FID 1.57 (JiT-H/16), T2I 에서 latent 9B baseline 상회.
+AsymFlow를 이해하려면 먼저 표준 flow matching의 기호를 잡아야 합니다.
+
+### 4.1 등장하는 값
+
+| 기호 | 뜻 |
+|---|---|
+| `x_0` | 깨끗한 이미지, 데이터 |
+| `epsilon` | 가우시안 랜덤 노이즈 |
+| `t` | 시간 또는 noise level |
+| `x_t` | `x_0`와 `epsilon`을 섞은 중간 상태 |
+| `u` | 표준 flow matching이 예측하는 velocity |
+| `u_A` | AsymFlow가 예측하는 asymmetric velocity |
+| `P` | 노이즈를 중요한 부분공간으로 떨어뜨리는 projector |
+
+### 4.2 중간 상태 `x_t`
+
+표준 rectified flow / flow matching에서는 보통 다음처럼 clean image와 noise를 직선으로 섞습니다.
+
+```math
+x_t = (1-t)x_0 + t\epsilon
+```
+
+직관적으로는 이렇습니다.
+
+```text
+t = 0   -> 거의 clean image
+t = 0.5 -> image와 noise가 반반 섞임
+t = 1   -> 거의 pure noise
+```
+
+### 4.3 정답 velocity `u`
+
+이 직선 경로에서 정답 velocity는 다음입니다.
+
+```math
+u = \epsilon - x_0
+```
+
+즉 네트워크는 `x_t`와 `t`를 보고, "이 지점에서 noise 방향으로 가는 속도"를 예측합니다.
+
+```text
+network(x_t, t) -> u_hat
+target          -> epsilon - x_0
+```
+
+AsymFlow는 여기서 네트워크 구조를 바꾸지 않습니다. 바꾸는 것은 target입니다.
 
 ---
 
-## 3️⃣ 주요 알고리즘 설명
+## 5. 핵심 아이디어: 노이즈 항만 저랭크로 줄이기
 
-*왜 이 장이 있나 — AsymFlow 의 핵심은 한 줄짜리 파라미터화 트릭이지만, "왜 통하는지" 와 "어떻게 진짜 속도로 되돌리는지" 가 직관과 식 양쪽으로 함께 잡혀야 이해됨. 그림 + 식 + 코드 매핑을 순서대로 정리.*
+### 5.1 기존 정답과 AsymFlow 정답
 
-### Fig.2 — 논문의 시각적 핵심
+기존 flow matching 정답:
+
+```math
+u = \epsilon - x_0
+```
+
+AsymFlow 정답:
+
+```math
+u_A = P\epsilon - x_0
+```
+
+두 식을 나란히 보면 차이가 선명합니다.
+
+| 항목 | 기존 Flow Matching | AsymFlow |
+|---|---|---|
+| 데이터 항 | `-x_0` | `-x_0` |
+| 노이즈 항 | `epsilon` | `P epsilon` |
+| 의미 | 모든 노이즈 방향 학습 | 중요한 r개 방향의 노이즈만 학습 |
+
+중요한 점:
+
+```text
+데이터 x_0는 줄이지 않는다.
+노이즈 epsilon만 줄인다.
+```
+
+그래서 이름이 **Asymmetric Flow**입니다. 데이터와 노이즈를 대칭적으로 다루지 않고, 노이즈에만 저랭크 사영을 겁니다.
+
+### 5.2 `P epsilon`이 의미하는 것
+
+`P`는 projector입니다. 어떤 벡터를 특정 부분공간으로 떨어뜨리는 선형 연산입니다.
+
+```text
+epsilon       = 모든 방향의 랜덤 노이즈
+P epsilon     = 중요한 r개 방향에 남은 노이즈
+(I-P)epsilon  = 잘라낸 나머지 노이즈
+```
+
+그림으로 생각하면 이렇습니다.
+
+```text
+원래 noise:
+  모든 방향으로 삐죽삐죽한 고차원 랜덤 벡터
+
+AsymFlow noise:
+  이미지 데이터가 자주 변하는 주요 방향으로만 남긴 noise
+```
+
+즉 AsymFlow는 입력 노이즈를 없애는 방법이 아닙니다. **학습 정답 안에 들어가는 노이즈 항만 정리하는 방법**입니다.
+
+### 5.3 무엇이 제거되는가
+
+노이즈는 항상 다음처럼 나눌 수 있습니다.
+
+```math
+\epsilon = P\epsilon + (I-P)\epsilon
+```
+
+이걸 기존 정답에 넣으면:
+
+```math
+u = \epsilon - x_0
+  = P\epsilon + (I-P)\epsilon - x_0
+```
+
+AsymFlow 정답은:
+
+```math
+u_A = P\epsilon - x_0
+```
+
+따라서 차이는 정확히 이것입니다.
+
+```math
+u - u_A = (I-P)\epsilon
+```
+
+말로 풀면:
+
+> **AsymFlow는 표준 velocity target에서 `P` 바깥쪽 랜덤 노이즈 `(I-P)epsilon`만 제거한다.**
+
+이게 논문의 핵심입니다.
+
+---
+
+## 6. `P`는 어떻게 만드는가: PCA basis
+
+### 6.1 `P = A A^T`
+
+논문에서는 projector를 다음처럼 둡니다.
+
+```math
+P = A A^T
+```
+
+여기서 `A`는 중요한 방향들을 열로 모아둔 행렬입니다.
+
+```text
+A = [중요한 방향 1, 중요한 방향 2, ..., 중요한 방향 r]
+```
+
+`r`은 rank, 즉 몇 개 방향을 남길지입니다.
+
+ImageNet scratch 실험에서는:
+
+```text
+patch size = 16 x 16 x 3 = 768 차원
+r = 8
+```
+
+즉 768차원 patch noise를 8개 주요 방향으로만 남깁니다.
+
+### 6.2 왜 PCA를 쓰는가
+
+노이즈 자체는 모든 방향이 똑같습니다.
+
+```text
+epsilon ~ N(0, I)
+```
+
+그래서 노이즈만 보고는 "어떤 방향이 중요한가"를 고를 수 없습니다. 모든 방향이 같은 분산을 가지기 때문입니다.
+
+대신 데이터 patch를 봅니다.
+
+```text
+ImageNet patch들을 많이 모음
+-> PCA를 돌림
+-> 이미지 patch가 실제로 자주 변하는 방향을 찾음
+-> 그중 상위 r개를 A로 사용
+```
+
+이렇게 하면 `P`는 다음 의미를 가집니다.
+
+```text
+P = 이미지 데이터가 자주 변하는 주요 방향만 남기는 필터
+```
+
+### 6.3 ImageNet에서 PCA 절차
+
+ImageNet scratch 학습에서는 대략 다음 과정을 한 번 수행합니다.
+
+1. ImageNet 이미지를 16x16 RGB patch로 자릅니다.
+2. patch 하나를 768차원 벡터로 펼칩니다.
+3. 많은 patch를 모아 PCA를 합니다.
+4. 고유값이 큰 상위 8개 방향을 고릅니다.
+5. 그 방향들을 `A`로 저장합니다.
+6. 학습 중에는 `A`를 업데이트하지 않고 고정합니다.
+
+코드 기준으로는 PCA subspace가 checkpoint로 저장되어 사용됩니다.
+
+```text
+checkpoints/asymflow_subspace_pca_dit.pth
+```
+
+---
+
+## 7. Figure 2로 보는 AsymFlow
+
+### 7.1 Figure 2(a): 학습 target 바꾸기
 
 <p align="center">
   <img src="figures/asymflow_fig2.png" alt="AsymFlow Parameterization and Recovery (Fig. 2)" width="900"/>
@@ -114,449 +359,514 @@
 
 *Source: Chen et al., "Asymmetric Flow Models", arXiv:2605.12964 (2026), Fig. 2.*
 
-> **(좌) (a) Full-rank flow vs AsymFlow parameterization — 학습 타깃을 어떻게 바꿨나.**
-> **(우) (b) Converting asymmetric velocity to full-rank velocity — 바꾼 타깃을 어떻게 원래대로 합치나.**
+Figure 2(a)는 기존 flow와 AsymFlow target을 비교합니다.
 
-### 3.1 Fig.2 (a) — 학습 타깃 단순화
+```text
+기존:
+  u = epsilon - x_0
 
-*왜 이 절을 두나 — 네트워크가 D차원 (예: 196,608) 풀랭크 노이즈를 다 맞춰야 하는 부담을 덜기 위해, 학습 정답의 노이즈 항만 저랭크로 깎는 발상을 그림과 함께 명시.*
-
-**기존 flow matching 의 정답** (윗줄):
-
-```
-u = (−x₀) + ε       ← 데이터 항 (풀랭크) + 노이즈 항 (풀랭크)
+AsymFlow:
+  u_A = P epsilon - x_0
 ```
 
-그림 윗줄: 새 사진 (`x₀`) 과 픽셀마다 빽빽한 가우시안 잡음 (`ε`) 이 합쳐진 결과. 네트워크가 `D` 차원 (예: 256×256×3 = 196,608) 전체 노이즈를 다 예측해야 함.
+여기서 봐야 할 것은 하나입니다.
 
-**AsymFlow 가 바꾼 정답** (아랫줄, Eq.2):
-
-```
-u_A = (−x₀) + P·ε   ← 데이터 항 (풀랭크) + 노이즈 항 (저랭크, r ≪ D)
-```
-
-차이는 **노이즈 항 앞에 사영기 `P` 가 붙은 것 하나뿐**. `P = A·Aᵀ` 는 rank-r 부분공간 사영기 (`A ∈ ℝ^(D×r)`, `AᵀA = I_r`).
-
-(즉, 정답에서 노이즈만 "주요 변동축 `r` 개로 그리기" 제약을 건 것. 데이터 항은 풀랭크 그대로 유지.)
-
-그림 아랫줄 가운데 칸: 노이즈가 패치 단위 부드러운 텍스처처럼 보이는 게 사영 효과. 자유도가 `D` 에서 `r` 로 압축됨.
-
-**왜 통하는가** — 풀랭크 노이즈 `ε` 는 D차원 전체에 흩뿌려진 잡음이지만, *데이터 매니폴드 의미 있는 변화 방향* 은 사실 저랭크. 네트워크가 부분공간 바깥쪽 무작위 노이즈까지 맞출 필요 없이 핵심 `r` 방향만 잘 잡으면 됨.
-
-**PCA denoising 관점에서 본 (a)** — 같은 일을 *"학습 정답에서 무엇을 뺐는가"* 로 보면 더 명료. 항등식 `ε = P·ε + (I−P)·ε` 로 표준 정답을 쪼개면:
-
-```
-u = ε − x₀ = P·ε + (I−P)·ε − x₀
-                          ↑
-              AsymFlow 가 빼버린 부분
+```text
+노이즈 그림이 full-rank noise에서 low-rank noise로 바뀐다.
+데이터 x_0 항은 그대로다.
 ```
 
-→ `u − u_A = (I−P)·ε`. 즉 **AsymFlow = 표준 정답에서 *PCA bottom (작은 eigenvalue) 방향* 의 무작위 잡음을 잘라낸 PCA denoising**. *"노이즈를 추가/유지"* 가 아니라 *"학습 라벨에서 학습 불가능한 noise 방향 성분을 제거"* 가 더 정확한 표현. 평소 PCA denoising 을 데이터에 거는 대신 *학습 정답에 건 것*.
+즉 AsymFlow는 이미지를 압축하는 방법이 아니라, **정답 velocity 안의 noise part를 압축하는 방법**입니다.
 
-#### 식 단계별 풀이 — 위 식이 왜 성립하나
+### 7.2 Figure 2(b): 다시 full velocity로 복원하기
 
-**Step 1: 노이즈 ε 를 두 직교 조각으로 분해**
+학습 target은 `u_A`로 바꿨지만, 샘플링과 flow update에는 결국 full velocity가 필요합니다.
 
-`P` 와 `(I−P)` 는 *벡터를 두 직교 방향으로 쪼개는 보완적 필터* :
-- `P` = "top-r 방향 성분만 남기는 필터" (나머지는 잘라냄)
-- `(I−P)` = "나머지 방향 성분만 남기는 필터" (top-r 은 잘라냄)
+그래서 네트워크 출력 `u_A_hat`을 다시 `u_hat`으로 바꿔야 합니다.
 
-수학적 사실 `P + (I−P) = I` (항등행렬, *아무것도 안 바꾸는 필터*) 이라서:
+논문이 쓰는 복원 공식은 다음입니다.
 
-```
-ε = I·ε = (P + (I−P))·ε = P·ε + (I−P)·ε
-```
-
-→ `3 = 1 + 2` 처럼 무조건 성립하는 *항등식*. 어떤 ε 든 *두 조각으로 쪼개 합치면 원래 그대로*.
-
-**2D 화살표 비유** — 화살표 `ε = (3, 4)` 한 개를 두 필터로 쪼개면:
-
-| 필터 | 정의 | ε 에 적용한 결과 |
-|---|---|---|
-| **P** (x축만 남기기) | 위아래 성분 잘라냄 | `(3, 0)` |
-| **(I−P)** (y축만 남기기) | 좌우 성분 잘라냄 | `(0, 4)` |
-
-다시 합치면 `(3, 0) + (0, 4) = (3, 4) = ε` ✓. AsymFlow 도 같은 원리, 단지 *768 차원에서 PCA top-8 방향 + 나머지 760 방향* 으로 쪼개는 것뿐.
-
-**Step 2: 표준 정답 u 의 ε 자리에 분해 끼워 넣기**
-
-원래 정의 `u = ε − x₀` 의 `ε` 자리에 위 항등식을 그대로 대입:
-
-```
-u = ε − x₀ = (P·ε + (I−P)·ε) − x₀ = P·ε + (I−P)·ε − x₀
+```math
+\hat{u}
+= P\hat{u}_A
++ (I-P)\frac{x_t + \hat{u}_A}{\sigma_t}
 ```
 
-→ **같은 식 한 개**. 단지 가운데 `ε` 를 *두 조각으로 풀어 적었을 뿐*. 등호 두 개는 *"같은 식을 다른 형태로 쓴 것"* 표시. 수학적 변경 없음.
+처음 보면 복잡하지만 의미는 단순합니다.
 
-**Step 3: AsymFlow 정답과 같은 자리에 정렬해서 비교**
+```text
+P 안쪽:
+  u_A가 원래 velocity u와 같으므로 그대로 사용
 
-세 자리 (top-r 조각 / 나머지 조각 / 데이터) 로 풀어 쓰면 비교가 한눈에 됨:
-
-```
-u   = P·ε + (I−P)·ε + (−x₀)
-u_A = P·ε +    0    + (−x₀)
-```
-
-| 자리 | 표준 u | AsymFlow u_A | 차이 |
-|---|---|---|---|
-| top-r 노이즈 `P·ε` | 있음 | 있음 | ✅ 같음 |
-| 나머지 노이즈 `(I−P)·ε` | 있음 | **0** | ❌ AsymFlow 가 잘라냄 |
-| 데이터 `−x₀` | 있음 | 있음 | ✅ 같음 |
-
-→ 차이는 정확히 한 조각: `u − u_A = (I−P)·ε`.
-
-**왜 굳이 풀어 쓰나** — 그냥 `u = ε − x₀` 와 `u_A = P·ε − x₀` 를 비교하면 *무엇이 다른지 한눈에 안 보임* (`ε` 와 `P·ε` 의 차이를 따로 계산해야 함). 표준 정답을 *세 조각으로 풀어두면 같은 자리끼리 비교* 가 가능해 *(I−P)·ε 가 잘렸다* 가 즉시 보임. **풀어 쓴 식 `P·ε + (I−P)·ε − x₀` 의 유일한 목적이 이 비교**.
-
-**숫자로 따라가기** — `ε = (3, 4)`, `−x₀ = (−1, −1)` 이라 하면:
-- 표준 정답: `u = (3, 4) + (−1, −1) = (2, 3)`
-- 같은 정답을 세 조각으로: `u = (3, 0) + (0, 4) + (−1, −1) = (2, 3)` ← 합산 결과 동일
-- AsymFlow 정답: `u_A = (3, 0) + (−1, −1) = (2, −1)` ← `(0, 4)` 조각 빼고 합
-- 차이: `u − u_A = (2, 3) − (2, −1) = (0, 4) = (I−P)·ε` ✓
-
-→ **같은 데이터에 노이즈 한 조각만 빼고 학습 시키는 것** 이 AsymFlow.
-
-> **중요**: 네트워크 구조도, 옵티마이저도, 학습 절차도 한 줄 안 바뀜. *학습 라벨* 만 `u` 에서 `u_A` 로 갈아끼움.
-
-### 3.2 부분공간 / 직교 여집합 분해 (Eq.8) — 왜 (b) 가 가능한가
-
-*왜 이 절을 두나 — 비대칭 속도가 두 직교 부분에서 각각 어떤 형태의 예측 (속도 vs 데이터) 과 동치인지 먼저 파악해야, 다음 절 (b) 의 풀랭크 복원 회로가 자연스럽게 따라나옴.*
-
-`u_A` 를 두 직교 성분으로 쪼개면:
-
-```
-P·u_A     = P·ε − P·x₀ = P·u           (부분공간 안 — 진짜 속도와 같음)
-(I−P)·u_A = −(I−P)·x₀                   (직교 여집합 — x₀ 예측과 같음)
+P 바깥쪽:
+  u_A는 사실 -x_0처럼 생겼으므로,
+  x_0 prediction을 velocity prediction 형태로 바꿔서 사용
 ```
 
-→ 비대칭 속도는 **부분공간 안에선 u-prediction, 바깥쪽에선 x₀-prediction** 처럼 동작하는 *혼합형* 파라미터화.
+### 7.3 왜 `P` 안쪽은 그대로 써도 되는가
 
-**PCA 언어로 본 의미**:
-- 부분공간 `Im(P)` = **PCA 의 큰 eigenvalue (top-r) 방향** = *데이터가 실제로 변하는 신호 방향*. 이 방향엔 `−x₀` 의 의미 있는 성분이 살아 있어, 노이즈 `P·ε` 와 만나도 *flow matching 학습 가치가 있는 정답* 형성.
-- 직교 여집합 `Im(I−P)` = **PCA 의 작은 eigenvalue (bottom D−r) 방향** = *데이터가 거의 안 가는 noise 방향*. 여기선 `(I−P)·x₀ ≈ 0`. 표준 정답은 이 방향에 무작위 잡음 `(I−P)·ε` 만 있어 학습 불가능했는데, AsymFlow 는 그걸 제거해 *정답이 ≈ 0 인 trivial 영역*으로 만듦.
+AsymFlow target은 다음입니다.
 
-**랭크 family 해석**:
-- `r = 0` → `P = 0` → `u_A = −x₀` (전부 x₀-prediction, 부호 차이)
-- `r = D` → `P = I` → `u_A = u` (전부 표준 u-prediction)
-- `0 < r ≪ D` → 두 장점의 절충, 본 논문 핵심 영역 (ImageNet 에선 `r=8` 최적)
-
-### 3.3 Fig.2 (b) — 풀랭크 속도 복원 회로
-
-*왜 이 절을 두나 — 학습 손실과 샘플링은 결국 진짜 속도 `û` 가 필요하므로, 단순화된 네트워크 출력 `û_A` 를 그 자리에 그대로 쓸 수 없음. 항등식으로 되돌리는 후처리 회로를 정의해야 표준 flow matching 코드에 꽂힘.*
-
-샘플링과 손실 계산은 진짜 속도 `û` 가 필요. 네트워크 출력 `û_A` 를 두 성분으로 쪼개 따로 처리한 뒤 합산.
-
-**최종 복원 공식** (Eq.10):
-
-```
-û = P·û_A + (I−P)·(x_t + û_A)/σ_t
+```math
+u_A = P\epsilon - x_0
 ```
 
-**그림 (b) 회로를 단계별로 따라가기**:
+양쪽에 `P`를 곱하면:
 
-| 단계 | Fig.2 (b) 위치 | 하는 일 | 식 |
-|---|---|---|---|
-| ① | 좌측 박스 "AsymFlow Network" | 네트워크가 비대칭 속도 출력 | `û_A = G_θ(x_t, t)` |
-| ② | 아래 가지 (녹색 박스 "Low-rank subspace") | 부분공간 안쪽 성분만 추출, 변환 불요 | `P·û_A` (이미 진짜 속도와 같음) |
-| ③ | 위 가지 첫 박스 `(I−P)` | 직교 여집합 성분 추출 — `x₀` 예측 형태 | `(I−P)·û_A = −(I−P)·x̂₀` |
-| ④ | 위 가지 `+x_t`, `÷σ_t` 박스 | `x₀` 스타일 → 속도 스타일로 환산 | `(I−P)·(x_t + û_A)/σ_t` |
-| ⑤ | 우측 ⊕ | 두 성분 더하기 | `û = ② + ④` |
-
-**④ 변환의 유도** — 보간식 `x_t = (1−t)·x₀ + t·ε` 와 속도식 `u = ε − x₀` 를 결합:
-
-```
-(I−P)·u = (I−P)·(x_t − x₀)/σ_t
+```math
+P u_A = P(P\epsilon - x_0)
+      = P\epsilon - P x_0
 ```
 
-여기에 `x̂₀ = −(I−P)·û_A` 대입하고 정리하면 ④ 박스의 식이 나옴.
+기존 velocity `u = epsilon - x_0`에 `P`를 곱하면:
 
-**PCA 방향별 *네트워크 학습 부담* 분담** — Fig.2 (b) 의 두 가지가 사실 *서로 다른 학습 작업* 의 결과를 합치는 것:
+```math
+P u = P(\epsilon - x_0)
+    = P\epsilon - P x_0
+```
 
-| PCA 방향 | 정답 형태 | 네트워크가 학습한 것 | (b) 의 처리 |
-|---|---|---|---|
-| **top-r (signal)** | `P·u_A = P·ε − P·x₀` | 의미 있는 *u-prediction* (노이즈→데이터 flow) | 그대로 사용 (변환 불요) |
-| **bottom D−r (noise)** | `(I−P)·u_A ≈ 0` | trivial — *x̂₀ ≈ 0* 만 출력하면 됨 | `x₀→속도` 환산 후 합산 |
+따라서:
 
-→ Fig.2 (b) 는 **"학습이 일어난 곳 (top-r) 의 결과 + 학습이 trivial 한 곳 (bottom) 의 결과"** 를 *방향별로 다른 경로* 로 합쳐 풀랭크 속도를 만드는 회로.
+```math
+P u_A = P u
+```
 
-> **요지**: Fig.2 (b) 는 *손실 함수도 샘플러도 안 바꿈*. 네트워크 출력에 위 5단계 회로 한 번만 적용하면 표준 flow matching 코드에 그대로 꽂힘.
+즉 `P` 안쪽 부분공간에서는 AsymFlow target이 기존 velocity와 정확히 같습니다.
 
-### 3.4 자주 헷갈리는 점
+### 7.4 왜 `P` 바깥쪽은 `x_0` prediction처럼 되는가
 
-*왜 이 절을 두나 — AsymFlow 의 저랭크 압축이 다른 "low-rank" 트릭 (LoRA 등) 과 자주 혼동되거나, "노이즈를 사영한다" 는 표현이 입력 노이즈까지 사영하는 걸로 오해되기 쉬워, 처음 접하는 독자가 막히는 3가지를 미리 정리.*
+이번에는 `I-P`를 곱합니다.
 
-1. **"노이즈가 정말 저랭크가 되는 거야?"** — 아니. 입력 `x_t` 에 들어가는 노이즈도, 샘플링 노이즈도 풀랭크 그대로. *학습 라벨의 노이즈 항만* 저랭크.
-2. **"왜 데이터 항은 사영 안 해?"** — `x₀` 는 자연 이미지로 이미 의미 있는 풀랭크 신호. 사영하면 정보 손실. 반면 `ε` 는 무의미한 무작위라 압축해도 본질 손해 없음.
-3. **"LoRA 랑 같은 거야?"** — 전혀 다름. LoRA 는 *가중치 측* 저랭크 (`ΔW = B·A`, rank 256), Fig.2 의 `P` 는 *데이터/노이즈 측* 저랭크 (rank 8/128). 자세한 비교는 [Q2](#q2-fig2-에서-lora-를-사용하는가) 참조.
-4. **"PCA 의 큰 eigenvalue 방향 = signal 방향인데, 거기에 노이즈를 사영하는 게 직관에 어긋나지 않나?"** — 두 가지 "noise" 의미를 구분해야 함. PCA 의미의 *noise dimension* = 작은 eigenvalue 방향. AsymFlow 가 노이즈를 큰 eigenvalue (signal) 방향에 남기는 이유는, *flow matching 의 노이즈→데이터 경로* 가 *데이터 매니폴드 안에서* 일어나야 학습할 가치가 있기 때문. 노이즈를 signal 방향에 *정렬* 시킨다고 보면 직관과 일치. 자세히는 [Q5](#q5-pca-관점에서-한-줄로-요약하면) 참조.
-5. **"이중 denoising 인가?"** — 어떤 의미에선 맞다. *(i) PCA denoising 으로 학습 정답 청소 (학습 전 사전 처리) + (ii) 학습된 네트워크가 시간 축 따라 노이즈→데이터 denoising 수행 (학습 중)*. 두 작용이 *직교 분담* 으로 협력해 학습 효율 ~40% 향상. 같은 일을 두 번 하는 게 아니라 *서로 다른 단계의 청소* 가 결합된 것.
+```math
+(I-P)u_A
+= (I-P)(P\epsilon - x_0)
+```
 
-### 3.5 A 행렬 두 가지 구성법
+`P` 안에 있는 것은 `I-P`로 보면 사라집니다.
 
-*왜 이 절을 두나 — 사영기 `P = A·Aᵀ` 의 핵심인 `A` 행렬을 어떻게 만드냐가 scratch 학습과 latent→pixel 미세조정 두 시나리오에서 갈리므로, 본격 학습 셋업 (3.6, 3.7) 직전에 구성법을 정리.*
+```math
+(I-P)P\epsilon = 0
+```
 
-| 시나리오 | A 만드는 법 | r 결정 방식 | 어디 저장? |
-|---|---|---|---|
-| **Scratch (ImageNet)** | 학습 데이터 patch 들에 PCA, 상위 r 방향 | ablation sweep (Fig.5 `rank_fid.pdf`) → **r=8** | `checkpoints/asymflow_subspace_pca_dit.pth` |
-| **사전학습 latent → pixel 미세조정 (AsymFLUX.2)** | latent 변수와 대응 pixel patch 사이 직교 Procrustes alignment | latent patch 차원 `d=128` 매칭 → **r=128** | `checkpoints/asymflow_subspace_procrustes.pth` |
+그래서:
 
-**ImageNet 의 PCA 절차 세부** (학습 시작 전 1회):
+```math
+(I-P)u_A = -(I-P)x_0
+```
 
-1. ImageNet train 이미지를 16×16 RGB patch 로 자름 → 한 patch 차원 `D = 16×16×3 = 768`
-2. 수많은 patch 모아 데이터 행렬 `X ∈ ℝ^(768 × N)` 구성
-3. 공분산 `C = X·Xᵀ / N` (768×768) 계산
-4. 고유분해 → 768 개 고유벡터·고유값
-5. **고유값이 큰 순서로 상위 8 개 고유벡터** 를 A 의 열로 쌓음 (`A ∈ ℝ^(768 × 8)`)
-6. 자동으로 `AᵀA = I_8` (PCA 의 정규직교성)
-7. 파일 저장. 학습 동안 `A` 는 업데이트되지 않음 (frozen).
+즉 `P` 바깥쪽에서 AsymFlow target은 velocity가 아니라 **clean image `x_0`를 예측하는 형태**가 됩니다. 부호만 반대입니다.
 
-**A 각 열의 시각적 의미** — 16×16 RGB patch 한 장으로 그릴 수 있음. ImageNet 의 경우 상위 방향들은 보통:
-- 1번 ≈ 평균 밝기 변화 (전체 밝아짐/어두워짐)
-- 2~3번 ≈ 큰 색 그래디언트 (좌우·상하 색 변화)
-- 4~7번 ≈ 더 미세한 색·밝기 패턴
-- 8번 ≈ 더 잔잔한 패턴
+정리하면:
 
-→ "ImageNet 패치가 자주 보이는 변동 패턴 8 가지" 가 A 의 8 개 열에 박혀 있음. 이게 *데이터 매니폴드의 r-차원 접평면* 의 의미.
+| 영역 | AsymFlow가 하는 일 |
+|---|---|
+| `P` 안쪽, top-r 방향 | 기존 flow velocity와 동일하게 학습 |
+| `I-P` 바깥쪽 | 랜덤 노이즈를 제거하고 `x_0` prediction처럼 학습 |
 
-### 3.6 ImageNet scratch 학습 (JiT-H/16)
-
-*왜 이 절을 두나 — 사전학습 boost 없이 처음부터 (random init) 학습해도 AsymFlow 단독으로 1.57 FID 가 가능함을 보이는 본 논문 메인 실증 셋업. 모든 하이퍼파라미터를 한 표에 모아 재현 가능성 확보.*
-
-`configs/asymflow/asymflow_h_16_r8_imagenet_8gpus.py` 기준:
-
-- 백본: AsymJiT (hidden_size=1280, depth=32, num_heads=16, bottleneck_dim=256, in_channels=3, patch_size=16, input_size=256, num_classes=1000)
-- 랭크: `base_rank=8`
-- 옵티마이저: AdamW (lr=2e-4, betas=(0.9, 0.95), weight_decay=0)
-- 학습: 600 epoch × 1251 step = 750,600 iter, 5 epoch linear warmup
-- 배치: GPU당 128, 총 8 GPU → batch 1024
-- EMA momentum 0.9999, bfloat16
-- **LoRA 사용 안 함** — 모든 가중치 풀학습
-
-### 3.7 AsymFLUX.2 klein 미세조정 (T2I)
-
-*왜 이 절을 두나 — 이미 학습된 latent 9B 모델 (FLUX.2 klein) 의 가중치를 버리지 않고 픽셀 공간으로 옮기는 두 번째 활용 시나리오. 32 GPU × 20K iter 라는 적은 자원으로 9B 픽셀 모델을 만들어내는 비결인 *frozen backbone + LoRA + Procrustes + Oklab* 조합을 한 표에 정리.*
-
-`configs/asymflow/asymflux2_klein_32gpus.py` 기준:
-
-**유지** (FLUX.2 klein 9B 그대로):
-- Transformer 본체: `num_layers=8` (joint MMDiT), `num_single_layers=24` (single), `attention_head_dim=128`, `num_attention_heads=32`, `joint_attention_dim=12288`
-- 텍스트 인코더 (joint_attention_dim 매칭으로 그대로 사용)
-- 사전학습 가중치: `black-forest-labs/FLUX.2-klein-base-9B`
-
-**바꿈**:
-- `in_channels=3` (latent 16ch → pixel RGB), `patch_size=16`
-- VAE 제거 → Oklab 색공간 변환 + 학습된 선형 projection
-- `base_rank=128` (저랭크 노이즈 사영)
-- `pretrained_linear_proj='checkpoints/asymflow_subspace_procrustes.pth'`
-- 본체 frozen, **rank-256 LoRA** (dropout 0.05) 부착:
-  - `*.ff.linear_in/out`, `*.ff_context.linear_in/out` (FFN)
-  - `timestep_embedder.linear_1/2`
-  - `single_transformer_blocks.*.attn.to_out`
-
-**학습 데이터셋**:
-- **LAION-Aesthetics 의 3M subset** — safety filter + aesthetics filter 로 한 번 더 큐레이션된 부분집합 (부록 §B 명시)
-- **1 메가픽셀 (1MP, ~1024×1024) 해상도** 로 리사이즈
-- 원본 alt-text 대신 **Qwen2.5-VL 로 캡션 재생성** (recaptioning — 노이즈 많은 web alt-text 대체)
-
-**최적화**:
-- 8-bit Adam, lr=1e-4 (`proj_out` 만 1e-3), betas=(0.9, 0.95)
-- 32 GPU, batch 8/GPU = **batch 256**
-- **학습 20K iter (config) / 평가에는 15K iter 체크포인트 사용** (부록 §B)
-- 비용: **약 1100 H100 GPU 시간** (= 32 GPU × ~1.5 일)
-- EMA 가중치 사용 (dynamic schedule, γ=7.0)
-- 샘플링: UniPC + APG, 38 step
+그래서 AsymFlow는 `u`-prediction과 `x_0`-prediction을 섞은 family로 볼 수 있습니다.
 
 ---
 
-## 4️⃣ 실험 요약
+## 8. rank `r`로 보는 통합 해석
 
-*왜 이 장이 있나 — 파라미터화 트릭 (Fig.2) 만으로 (1) 픽셀 공간이 latent 와 동급에 도달하는지, (2) 학습 효율 향상이 측정 가능한 수치로 나오는지, (3) 랭크 r 에 sweet spot 이 있는지를 차례로 검증하는 ablation 모음.*
+AsymFlow는 `r` 값에 따라 기존 parameterization들을 포함합니다.
 
-### ImageNet 256×256 (Class-conditional)
+### 8.1 `r = 0`
 
-*왜 이 절을 두나 — 픽셀 공간 AsymFlow 가 같은 자원·아키텍처에서 latent baseline (DiT-XL/RAE, REPA-XL) 을 따라잡는지 확인하는 본 논문 메인 실험.*
+`P = 0`이면:
+
+```math
+u_A = -x_0
+```
+
+즉 전체가 `x_0` prediction과 비슷해집니다.
+
+### 8.2 `r = D`
+
+`P = I`이면:
+
+```math
+u_A = \epsilon - x_0 = u
+```
+
+즉 기존 flow matching의 `u`-prediction과 완전히 같습니다.
+
+### 8.3 `0 < r << D`
+
+AsymFlow가 실제로 쓰는 영역입니다.
+
+```text
+너무 작으면:
+  velocity 정보를 거의 못 씀
+
+너무 크면:
+  다시 풀랭크 랜덤 노이즈를 많이 맞춰야 함
+
+적당히 작으면:
+  의미 있는 방향의 velocity만 배우고, 나머지 낭비를 줄임
+```
+
+ImageNet에서는 `r=8` 근처가 sweet spot으로 보고됩니다.
+
+---
+
+## 9. 두 가지 사용 시나리오
+
+AsymFlow는 크게 두 방식으로 쓰입니다.
+
+```text
+1. ImageNet에서 픽셀 모델을 scratch로 학습
+2. 이미 학습된 latent FLUX 모델을 pixel 모델로 옮겨 finetune
+```
+
+### 9.1 ImageNet scratch 학습
+
+이 실험은 AsymFlow 자체가 효과가 있는지 가장 깨끗하게 보여줍니다. 사전학습 latent 모델을 가져오는 것이 아니라, 픽셀 공간에서 처음부터 학습합니다.
+
+코드 기준:
+
+```text
+configs/asymflow/asymflow_h_16_r8_imagenet_8gpus.py
+```
+
+주요 설정:
+
+| 항목 | 값 |
+|---|---|
+| 백본 | JiT-H/16 계열 pixel transformer |
+| 입력 | 256x256 RGB image |
+| patch size | 16 |
+| patch dimension | 16x16x3 = 768 |
+| rank | `r=8` |
+| optimizer | AdamW, lr 2e-4 |
+| batch | 8 GPU x 128 = 1024 |
+| training | 600 epoch, 약 750K iter |
+| LoRA | 사용하지 않음 |
+
+핵심은 이것입니다.
+
+> **ImageNet 결과는 LoRA나 latent pretrained boost가 아니라, AsymFlow parameterization 자체의 효과를 보여주는 scratch 실험이다.**
+
+### 9.2 FLUX.2 klein pixel-space finetune
+
+두 번째 시나리오는 더 실용적입니다. 이미 학습된 latent T2I 모델을 버리지 않고, pixel-space 모델로 옮깁니다.
+
+코드 기준:
+
+```text
+configs/asymflow/asymflux2_klein_32gpus.py
+```
+
+여기서는 PCA 대신 **Procrustes alignment**로 `A`를 만듭니다.
+
+왜냐하면 목표가 단순 scratch 학습이 아니라:
+
+```text
+pretrained latent representation
+        |
+        v
+pixel patch representation
+```
+
+이 둘을 잘 맞춰서 기존 FLUX.2 klein 가중치를 최대한 재사용하는 것이기 때문입니다.
+
+주요 설정:
+
+| 항목 | 값 |
+|---|---|
+| base model | FLUX.2 klein Base 9B |
+| 공간 | latent -> pixel RGB |
+| VAE | 제거 |
+| 색공간 | Oklab 정규화 |
+| rank | `r=128` |
+| `A` 구성 | latent-pixel Procrustes alignment |
+| 학습 방식 | base frozen + rank-256 LoRA |
+| 데이터 | LAION-Aesthetics 3M subset |
+| caption | Qwen2.5-VL recaptioning |
+| 학습 | 32 GPU, batch 256, 20K iter |
+| sampling | UniPC + APG, 38 step |
+
+여기서 LoRA와 AsymFlow의 low-rank는 서로 다릅니다.
+
+| 구분 | 어디에 적용되는 low-rank인가 | 역할 |
+|---|---|---|
+| AsymFlow `P = A A^T` | 데이터/노이즈 target | noise 항을 저랭크로 줄임 |
+| LoRA | 모델 weight update | 9B base를 적은 파라미터로 finetune |
+
+---
+
+## 10. 실험 결과 요약
+
+### 10.1 ImageNet 256x256
+
+AsymFlow는 픽셀 공간 모델로 latent baseline에 근접하거나 일부와 동급 결과를 냅니다.
 
 | 모델 | 공간 | FID |
 |---|---|---|
-| DiT-XL/2 (latent) | latent | ~2.27 |
+| DiT-XL/2 | latent | 약 2.27 |
 | DiT-XL + RAE | latent | 1.50 |
 | REPA-XL/2 | latent | 1.38 |
-| REPA-E-XL VAVAE | latent | 1.12 |
-| **AsymFlow JiT-H/16 (r=8)** | **pixel** | **1.76** |
-| **AsymFlow JiT-H/16 (r=8) + REPA** | **pixel** | **1.57** ✨ |
+| AsymFlow JiT-H/16, `r=8` | pixel | 1.76 |
+| AsymFlow JiT-H/16, `r=8` + REPA | pixel | 1.57 |
 
-→ 픽셀 모델이 latent 모델 (DiT-XL/RAE, 1.50) 과 동급. AsymFlow 자체의 효과는 약 1.76, REPA 결합으로 1.57.
+읽는 포인트:
 
-### T2I (AsymFLUX.2 klein vs latent baselines)
+```text
+픽셀 공간 모델이 더 이상 크게 뒤처지지 않는다.
+노이즈 target만 바꿔도 latent 모델과 경쟁 가능한 수준까지 올라간다.
+```
 
-*왜 이 절을 두나 — 픽셀 부활이 class-conditional 한정이 아니라, 더 어려운 텍스트-이미지 (T2I) 영역에서도 동급 latent 9B 를 능가하는지 확인. 본 논문이 단순 ImageNet 트릭에 머무르지 않음을 보이는 일반화 증거.*
+### 10.2 수렴 속도
 
-**평가 셋업** (학습 데이터셋과는 별도):
-- **System-level 비교** — HPSv3 (인간 선호), DPG-Bench, GenEval (지시이행 / 속성·관계·카운팅). 1024×1024 생성.
-- **Ablation 비교** — **COCO 2014 validation set 에서 10K 캡션** 추출해 1024×1024 생성. 메트릭: HPSv3, HPSv2.1 (인간 선호), VQAScore·CLIPScore (텍스트 정렬), FID·pFID (분포 거리).
-
-**공정 비교를 위한 baseline 셋업** (모두 같은 LAION-Aesthetics 3M 으로 학습):
-1. **FLUX.2 klein Base + latent finetune** — latent 공간에서 그대로 미세조정 (데이터 효과만 보는 통제군)
-2. **FLUX.2 klein Base + DDT finetune** — DDT decoder head 부착 픽셀 미세조정 (PixelDiT 스타일)
-3. **AsymFLUX.2 klein** — 본 논문 방법
-
-→ 결과: AsymFLUX.2 klein 이 HPSv3·HPSv2.1 에서 latent baseline 보다 명확히 상회 (*"AsymFlow pixel-space conversion 덕이지 dataset bias 가 아님"* 을 baseline 비교로 차단). DDT baseline 은 파라미터가 더 많아도 모든 메트릭에서 뒤짐 + 시각적으로 흐릿함·타일링 아티팩트. 정확한 숫자는 논문 Table 3 (ablation), Table 4 (system) 참조.
-
-### 수렴 속도 비교 (`figures/epoch_fid.pdf`)
-
-*왜 이 절을 두나 — Q4 의 (2) 항목 "capacity 낭비 제거" 가 정성적 직관에 그치지 않고 실제로 수렴이 빨라지는지 (epoch-FID 곡선) 측정 가능한 형태로 입증. 학습 효율 클레임의 정량 근거.*
+논문은 AsymFlow가 같은 FID에 더 빨리 도달한다고 보고합니다.
 
 <p align="center">
   <img src="figures/asymflow_epoch_fid.png" alt="AsymFlow vs JiT Convergence Speed" width="500"/>
 </p>
 
-*Source: Chen et al., "Asymmetric Flow Models", arXiv:2605.12964 (2026), Fig. on convergence speed comparison (unguided FIDs).*
+읽는 포인트:
 
-같은 백본·레시피에서 AsymFlow `r=8` 이 JiT `r=0` 대비 더 빨리 같은 FID 에 도달.
+```text
+per-step 계산이 크게 빨라지는 것이 아니다.
+학습해야 하는 target이 쉬워져서, 같은 품질까지 필요한 epoch 수가 줄어든다.
+```
 
-| Epoch | AsymFlow (`r=8`) | JiT (`r=0`) |
-|---|---|---|
-| 40 | ~43 | ~58 |
-| 80 | ~16 | ~18 |
-| 120 | ~12 | ~14 |
-| 160 | ~10 | ~11 |
+논문에서는 비슷한 FID에 도달하는 데 약 40% 빠르다고 설명합니다.
 
-논문 본문 (§6) 의 클레임: **"AsymFlow reaches comparable FID roughly 40% faster"** — 같은 FID 도달까지 epoch 수 약 40% 단축.
+### 10.3 rank `r` ablation
 
-**주의: 어떤 차원의 "빠름" 인가**:
-- *Wall-clock per step*: 거의 동일 — 사영 행렬곱 + 복원 회로의 비용 미미
-- *수렴까지 epoch/step 수*: ~40% 단축 ← 본 클레임
-- *추론 속도*: AsymFLUX.2 klein 은 VAE 가 없어 latent 대비 약간 빠름 (Appendix)
+rank를 바꾸면 이런 경향이 나옵니다.
 
-→ **총 학습 wall-clock 시간은 약 1.67× 단축**. [[paper_min_snr]] 의 3.4× 만큼은 아니지만 "수렴 속도 향상" 의 같은 결.
+```text
+r = 0:
+  x_0 prediction에 가까움. 충분하지 않음.
 
-### 랭크 r 와 FID 의 관계 (Fig.6 — `figures/rank_fid.pdf`)
+r가 조금 증가:
+  FID가 좋아짐.
 
-*왜 이 절을 두나 — 본문 §3.2 가 예측한 "작지만 0이 아닌 r 이 최적" 가설이 실제 곡선에서 확인되는지 검증. r 을 실무에서 어떻게 잡을지 가이드 제공 (ImageNet 은 8, FLUX 는 128).*
+r = 8 근처:
+  ImageNet sweet spot.
 
-- `r = 0` (x₀-pred 동치) → FID 높음
-- `r ↑` → FID 빠르게 개선
-- `r = 8` 근처에서 **sweet spot**, 그 이상 늘려도 큰 차이 없거나 약간 악화
-- `r = D` (표준 u-pred 동치) → 처음보다 나은 FID 지만 r=8 보단 못함
+r가 너무 큼:
+  다시 불필요한 랜덤 노이즈를 많이 학습하게 되어 이득이 줄어듦.
+```
 
-→ 저자들이 본문에서 예측한 *"작지만 0이 아닌 r 이 최적"* 가설을 실험으로 확인.
+즉 핵심은 "무조건 rank를 크게"가 아닙니다.
 
----
+> **작지만 0은 아닌 rank가 좋다.**
 
-## 5️⃣ 💬 Q&A 섹션
+### 10.4 T2I 결과
 
-### Q1. AsymFLUX.2 klein 은 FLUX.2 klein 9B 와 구조가 같은가?
+AsymFLUX.2 klein은 FLUX.2 klein 9B를 pixel-space로 옮긴 모델입니다.
 
-**Transformer 본체는 그대로, 입출력만 바뀌고 LoRA 로 살짝 적응한다.**
+논문은 HPSv3, DPG-Bench, GenEval 등에서 strong latent baseline과 비교합니다. 핵심 주장은:
 
-| 구성요소 | FLUX.2 klein 9B (원본) | AsymFLUX.2 klein | 동일? |
-|---|---|---|---|
-| Transformer 골격 | MMDiT (joint 8 + single 24 layers) | 동일 | ✅ |
-| `attention_head_dim`, `num_attention_heads`, `joint_attention_dim` | 128, 32, 12288 | 동일 | ✅ |
-| 사전학습 가중치 | — | `FLUX.2-klein-base-9B` 그대로 로드 | ✅ |
-| 입력 채널 | latent (16ch) | **pixel RGB (3ch)** | ❌ |
-| Patch size | latent 기준 | **픽셀 기준 16** | ❌ |
-| VAE encoder/decoder | 있음 | **제거**, 대신 Oklab + 학습된 linear projection | ❌ |
-| 노이즈 사영 | — | **base_rank=128** (P=A·Aᵀ) | ❌ (신규) |
-| 학습 방식 | 풀 사전학습 | **base frozen + rank-256 LoRA + 입출력 projection** | ❌ |
+```text
+AsymFlow 방식으로 pixel-space conversion을 하면,
+단순 latent finetune이나 DDT-style pixel finetune보다 좋은 품질과 prompt following을 얻는다.
+```
 
-요약: **9B 본체 가중치는 거의 그대로 재사용**, VAE 자리를 `Oklab + Procrustes 정렬된 선형 사영` 으로 대체, 본체는 LoRA 로 미세 적응. 32 GPU × 20K iter 라는 적은 비용으로 가능했던 이유.
+정확한 수치는 논문 Table 3, Table 4를 보는 것이 좋습니다. 이 문서에서 기억할 점은 하나입니다.
 
-### Q2. Fig.2 에서 LoRA 를 사용하는가?
-
-**아니, Fig.2 자체는 LoRA 와 무관하다.** 둘은 *완전히 다른 자리에 있는 다른 종류의 저랭크* 다.
-
-| 구분 | 어디에 적용? | 랭크 값 | 역할 |
-|---|---|---|---|
-| **Fig.2 의 저랭크 (P = A·Aᵀ)** | **데이터/노이즈 측** — 학습 타깃 | 8 (ImageNet) / 128 (FLUX) | 노이즈 ε 를 r 차원 부분공간으로 사영 |
-| **LoRA (ΔW = B·A)** | **네트워크 가중치 측** | 256 | base frozen + 어댑터만 학습 |
-
-논문 구조 상:
-- **Sec.4 (Fig.2)** — 파라미터화 트릭, *모든 AsymFlow 실험에 공통* (scratch / 미세조정 모두).
-- **Sec.5/6 (LoRA)** — FLUX.2 klein 미세조정 *한정* 의 학습 전략.
-
-ImageNet 실험은 LoRA 없이 풀 scratch 학습이며 1.57 FID 도 거기서 나온 결과.
-
-### Q3. AsymFlow 가 klein 이어서 학습이 아니라 scratch 학습에서도 통용되나?
-
-**그렇다. 사실 1.57 FID 결과 자체가 scratch 학습 사례다.**
-
-Fig.2 의 두 단계 — (a) 타깃 단순화, (b) 풀랭크 복원 — 는 *파라미터화 정의에서 따라나오는 수학 항등식* 이라 네트워크 초기값 (random / pretrained) 과 무관.
-
-| 항목 | Scratch (ImageNet, JiT-H/16) | 미세조정 (AsymFLUX.2) |
-|---|---|---|
-| Fig.2 (a) 타깃 `u_A = −x₀ + P·ε` | ✅ 그대로 | ✅ 그대로 |
-| Fig.2 (b) 복원 공식 | ✅ 그대로 | ✅ 그대로 |
-| A 행렬 만드는 법 | 데이터 patch **PCA** | latent-pixel **Procrustes** |
-| 랭크 r | 8 | 128 |
-| LoRA | 안 씀 | rank 256 부착 |
-| 결과 | FID 1.76 (+REPA → 1.57) | T2I SOTA |
-
-논문 본문 (Sec.4) 도 명시:
-
-> "When training AsymFlow from scratch, A can be obtained from a data-dependent patch basis, e.g., by applying PCA to image patches. When adapting a pretrained latent model, A is instead chosen to align the latent space with the pixel patch space …" (sections/4_asymflow.tex:35-36)
-
-오히려 scratch 가 Fig.2 효과를 *가장 깨끗하게 증명* 하는 환경 — 사전학습 가중치 boost 없이 순수 파라미터화 트릭의 효과만 측정 가능.
-
-### Q4. 이 방법을 써서 얻는 이점이 뭔가?
-
-**5가지 카테고리로 정리.** 가장 임팩트는 (1) + (4) 조합.
-
-| # | 이점 카테고리 | 무엇이 좋아지나 | 근거·참조 |
-|---|---|---|---|
-| **1** | **픽셀 공간 모델이 latent 와 동급/근접** | 그동안 거의 모든 SOTA 가 latent (VAE 압축) 공간에서만 가능했음. AsymFlow 는 픽셀 직접 학습으로 latent baseline 따라잡거나 능가 — VAE 사전학습·배포 부담 제거 가능 신호 | FID 1.57 (pixel) vs DiT-XL/RAE 1.50 (latent) — § 4️⃣ 실험표 |
-| **2** | **수렴 속도 ~40% 단축 + capacity 낭비 제거** | 네트워크가 풀랭크 무작위 노이즈를 운반할 필요 없음 → 같은 FID 도달까지 **epoch 수 약 40% 단축** (논문 §6 명시), 같은 모델 크기로 더 의미 있는 정보 학습. Wall-clock per step 은 그대로지만 총 학습 시간은 1.67× 단축 | § 4️⃣ 수렴 속도 비교 (Fig.epoch_fid) + § 3.1 |
-| **3** | **코드 변경 거의 0 (minimal trick)** | 네트워크·옵티마이저·스케줄·손실·샘플러 한 줄 안 바뀜. 추가 학습 비용은 PCA 한 번 (학습 시작 전) + 행렬곱 몇 번 (per step) | § 3.3 표의 5단계 회로 — *추가 forward/backward 없음* |
-| **4** | **사전학습 latent 모델 → pixel 전이** | 비싼 9B 모델을 처음부터 픽셀에서 재학습할 필요 없음. FLUX.2 klein 9B 본체 freeze + LoRA + Procrustes alignment 로 **32 GPU × 20K iter** 라는 적은 자원에 픽셀 버전 완성 | [Q1](#q1-asymflux2-klein-은-flux2-klein-9b-와-구조가-같은가) 표 + § 3.6 미세조정 절차 |
-| **5** | **옛 파라미터화 두 가지의 통합 시야** | `r=0` → x₀-prediction, `r=D` → u-prediction. 둘은 같은 family 의 두 극단으로 환원 — *"어느 게 좋은가"* 논쟁이 *"r 을 얼마로"* 의 문제로 정리. `A` 가 PCA 라 학습 방향 시각화·해석성 보너스 | § 3.2 랭크 family 해석 + § 4️⃣ Fig.6 rank-FID 곡선 |
-
-### Q5. PCA 관점에서 한 줄로 요약하면?
-
-> **AsymFlow = *PCA denoising 을 flow matching 의 학습 정답에 적용한 것*.** 통상 PCA denoising 은 *데이터* 를 깨끗하게 만드는 도구지만, AsymFlow 는 같은 P = A·Aᵀ 를 *학습 라벨* 에 걸어 *bottom (작은 eigenvalue) 방향의 무작위 잡음 (I−P)·ε 를 잘라낸다.* `A` 는 학습 시작 전 데이터 patch 에 PCA 돌려 *큰 eigenvalue 상위 r 개* 로 미리 만들고 freeze.
-
-**왜 데이터에 PCA 를 돌리고 결과를 노이즈에 적용하나** — 두 가지가 함께 필요:
-- *노이즈 자체의 PCA 는 의미 없음.* ε ~ N(0, I_D) 는 *모든 방향 분산 동일한 isotropic* 분포라 *모든 고유값이 1, 선호 축이 없음*. 노이즈에서는 r 개 방향을 뽑을 기준이 없음.
-- *데이터 PCA 가 알려주는 것은 "데이터 매니폴드의 모양" (r 차원 접평면).* 이 모양을 외부 기준으로 빌려와 *노이즈를 그 모양 안에 정렬* 시키는 게 P·ε 의 의미. 결과적으로 노이즈와 데이터가 *같은 의미 공간* 에서 만나, 학습 정답이 그 공간 안의 *coherent 한 한 점* 이 됨.
-
-**왜 *큰* eigenvalue 방향에 노이즈를 남기나** — *flow matching 의 노이즈→데이터 경로* 가 *데이터 매니폴드 안에서* 일어나야 학습 가치가 있기 때문. PCA 통상 의미의 *noise dimension* (= 작은 eigenvalue 방향) 은 데이터가 안 가는 변두리라, 거기 노이즈는 *학습 신호 없는 무작위 잡음*. 그걸 정답에서 *지워야* 함.
-
-**효과를 PCA denoising 의 통상 효과로 옮기면**:
-
-| PCA 방향 | 표준 정답에 들어있던 것 | AsymFlow 가 한 일 | 네트워크 효과 |
-|---|---|---|---|
-| **top-r (signal)** | 신호 + 신호 방향 noise | 그대로 유지 | 의미 있는 학습 |
-| **bottom (noise)** | ≈ 0 (데이터) + 무작위 noise | 무작위 noise *제거* | trivial → capacity 절약 |
-
-→ *"신호 방향엔 학습, noise 방향엔 학습 안 시킴"* 의 깔끔한 분담. 이게 수렴 ~40% 빨라지는 이유.
-
-**Fig.2 (a)/(b) 위치별 PCA 의미 매핑** (그림과 PCA 언어를 1:1 연결):
-
-| Fig.2 위치 | 식 | PCA 관점 의미 |
-|---|---|---|
-| (a) 윗줄 좌: Full-rank velocity | `u = ε − x₀` | *PCA denoising 안 한* 더러운 학습 정답 |
-| (a) 윗줄 중: Full-rank data | `−x₀` | 의미 있는 신호 (top-r 에 거의 다 있음) |
-| (a) 윗줄 우: Full-rank noise | `ε` | *모든 방향에 흩뿌려진* 가우시안 잡음 |
-| (a) 아랫줄 좌: Asymmetric velocity | `u_A = P·ε − x₀` | *PCA top-r 만 남긴* 깨끗한 학습 정답 |
-| (a) 아랫줄 우: Low-rank noise | `P·ε = A·(Aᵀ·ε)` | PCA 계수 r 개만 살아남은 노이즈 |
-| (b) 아래 녹색 박스 | `P·û_A` | top-r 방향: 학습이 일어난 곳, 변환 불필요 |
-| (b) 위 분홍 박스 (사영) | `(I−P)·û_A` | bottom 방향: x̂₀ 형태로만 출력 |
-| (b) 위 +x_t, ÷σ_t | `(I−P)·(x_t + û_A)/σ_t` | bottom 방향에서 x₀→속도 환산 |
-| (b) 오른쪽 ⊕ | `û = ① + ②` | 두 PCA 부분 합쳐 풀랭크 속도 |
-
-→ Fig.2 의 (a) 는 *학습 전 PCA denoising* 단계, (b) 는 *PCA 두 부분에서 다르게 학습된 결과를 합치는* 사후 처리 단계. 같은 사영기 P 가 *학습 전 청소* 와 *학습 후 합산* 양쪽에서 일하는 게 이 그림의 우아한 점.
-
-**이중 denoising 의 그림** — *(i) 학습 전 PCA denoising (정답 청소) + (ii) 학습 중 flow matching denoising (네트워크가 노이즈→데이터 경로 학습)*. 두 작용이 서로 직교하므로 *같은 일 반복* 이 아니라 *분담 협력*. 자세한 PCA 절차·시각화는 § 3.5 참조, Fig.2 의 PCA 분해는 § 3.1 / § 3.2 / § 3.3 참조.
+> **AsymFlow는 ImageNet용 작은 트릭이 아니라, pretrained T2I latent model을 pixel model로 옮기는 데도 쓸 수 있다.**
 
 ---
 
-## 6️⃣ 한 줄 요약 (전체)
+## 11. 코드에서 어떤 부분을 보면 좋은가
 
-> **학습 정답에서 노이즈 항만 r 차원 부분공간으로 압축 (`u_A = P·ε − x₀`) → 진짜 속도는 `û = P·û_A + (I−P)·(x_t + û_A)/σ_t` 로 항등식 복원. 네트워크 한 줄 안 바꾸고 ImageNet 1.57 FID, FLUX 픽셀 미세조정 T2I SOTA.**
+공식 코드는 `Lakonik/LakonLab` 안의 `configs/asymflow/`를 중심으로 보면 됩니다.
+
+### 11.1 ImageNet scratch
+
+```text
+configs/asymflow/asymflow_h_16_r8_imagenet_8gpus.py
+```
+
+여기서 확인할 것:
+
+```text
+base_rank = 8
+patch_size = 16
+in_channels = 3
+pretrained_linear_proj / PCA subspace checkpoint
+```
+
+### 11.2 FLUX pixel finetune
+
+```text
+configs/asymflow/asymflux2_klein_32gpus.py
+```
+
+여기서 확인할 것:
+
+```text
+base_rank = 128
+FLUX.2-klein-base-9B loading
+pretrained_linear_proj = asymflow_subspace_procrustes.pth
+LoRA rank = 256
+Oklab preprocessing
+```
+
+### 11.3 코드 읽을 때의 핵심 질문
+
+코드를 볼 때는 다음 세 가지를 찾으면 됩니다.
+
+```text
+1. target을 u에서 u_A로 바꾸는 곳은 어디인가?
+2. P 또는 A를 적용하는 곳은 어디인가?
+3. network output u_A_hat을 full velocity u_hat으로 복원하는 곳은 어디인가?
+```
+
+AsymFlow의 본질은 모델 architecture가 아니라 이 세 지점에 있습니다.
 
 ---
 
-## 7️⃣ 관련 메모리 링크
+## 12. 자주 헷갈리는 점
 
-- [[paper_min_snr]] — Min-SNR 도 *학습 손실의 한 군데만 손대는 minimal trick* 계열. AsymFlow 는 "타깃 자체를 손댐", Min-SNR 은 "타깃은 그대로, 가중치만 손댐" 으로 위치 분리.
-- [[paper_lumina_next]] — Sandwich Norm·tanh-AdaLN 등 *한 줄짜리 처방* 으로 큰 효과를 본 또 다른 사례.
-- [[reference_pretrained_backbone_reuse_landscape]] — AsymFLUX.2 klein 은 *분기 B (Diffusion backbone 재사용)* 의 새 사례 — VAE 를 떼고 픽셀로 옮기는 reuse 방식.
-- [[paper_z_image]] — Z-Image 도 단일 스트림 DiT 로 픽셀 측 부담을 줄이려 한 시도. AsymFlow 는 "픽셀 직접 학습" 의 또 다른 길.
+### Q1. 입력 노이즈 자체를 저랭크로 만드는가?
+
+아닙니다.
+
+입력 `x_t`를 만들 때의 노이즈와 샘플링 초기 노이즈는 여전히 full-rank입니다. AsymFlow가 바꾸는 것은 **학습 target 안의 노이즈 항**입니다.
+
+```text
+바꾸는 것:
+  target u = epsilon - x_0
+  -> target u_A = P epsilon - x_0
+
+바꾸지 않는 것:
+  모델 구조
+  optimizer
+  sampler의 큰 틀
+  입력 noise 자체
+```
+
+### Q2. 왜 `x_0`는 사영하지 않는가?
+
+`x_0`는 이미지 정보입니다. 사영하면 정보가 손실됩니다.
+
+반면 `epsilon`은 랜덤 노이즈입니다. 특히 데이터가 거의 변하지 않는 방향의 노이즈는 네트워크가 굳이 맞출 가치가 낮습니다.
+
+그래서 AsymFlow는 비대칭입니다.
+
+```text
+데이터 항: full-rank 유지
+노이즈 항: low-rank로 압축
+```
+
+### Q3. LoRA와 같은 low-rank인가?
+
+아닙니다.
+
+둘 다 low-rank라는 단어를 쓰지만 적용 위치가 다릅니다.
+
+```text
+AsymFlow:
+  학습 target의 noise part를 줄임
+
+LoRA:
+  모델 weight update를 low-rank adapter로 제한
+```
+
+ImageNet scratch 실험은 LoRA 없이도 동작합니다.
+
+### Q4. PCA denoising과 비슷한가?
+
+비슷하게 볼 수 있습니다. 다만 일반적인 PCA denoising은 데이터 자체를 깨끗하게 만들 때 쓰고, AsymFlow는 **학습 정답**을 깨끗하게 만듭니다.
+
+```text
+일반 PCA denoising:
+  noisy data -> PCA top components만 남김
+
+AsymFlow:
+  velocity target 안의 noise epsilon -> PCA top components만 남김
+```
+
+그래서 한 줄로 말하면:
+
+> **AsymFlow는 PCA denoising을 flow matching target에 적용한 것처럼 볼 수 있다.**
+
+### Q5. 왜 PCA의 큰 eigenvalue 방향에 노이즈를 남기는가?
+
+PCA의 큰 eigenvalue 방향은 이미지 patch가 실제로 많이 변하는 방향입니다.
+
+Flow matching은 noise에서 data로 가는 경로를 배우는 방식입니다. 그러려면 노이즈도 데이터가 의미 있게 변하는 방향에 있을 때 학습 가치가 큽니다.
+
+반대로 작은 eigenvalue 방향은 데이터가 거의 가지 않는 방향입니다. 그쪽의 랜덤 노이즈는 target에 있어도 네트워크에게 유용한 학습 신호가 되기 어렵습니다.
+
+```text
+큰 eigenvalue 방향:
+  데이터가 자주 변함 -> flow를 배울 가치 있음
+
+작은 eigenvalue 방향:
+  데이터가 거의 없음 -> 랜덤 노이즈를 맞추는 낭비가 큼
+```
+
+---
+
+## 13. AsymFlow를 한 번에 다시 보기
+
+전체 알고리즘을 가장 단순하게 쓰면 다음입니다.
+
+### 학습 전
+
+```text
+1. 이미지 patch들을 모은다.
+2. PCA를 한다.
+3. 상위 r개 방향을 A로 저장한다.
+4. P = A A^T로 projector를 만든다.
+```
+
+### 학습 중
+
+```text
+1. clean image x_0를 뽑는다.
+2. noise epsilon을 뽑는다.
+3. x_t = (1-t)x_0 + t epsilon을 만든다.
+4. 기존 target u = epsilon - x_0 대신
+   AsymFlow target u_A = P epsilon - x_0를 쓴다.
+5. network(x_t, t)가 u_A를 예측하도록 학습한다.
+```
+
+### 샘플링 또는 velocity 사용 시
+
+```text
+1. network가 u_A_hat을 낸다.
+2. P 안쪽 성분은 velocity로 그대로 쓴다.
+3. P 바깥쪽 성분은 x_0 prediction처럼 해석해 velocity로 변환한다.
+4. 둘을 합쳐 full velocity u_hat을 만든다.
+```
+
+공식:
+
+```math
+\hat{u}
+= P\hat{u}_A
++ (I-P)\frac{x_t + \hat{u}_A}{\sigma_t}
+```
+
+---
+
+## 14. 이 논문의 기여
+
+1. **Asymmetric velocity parameterization**  
+   `u_A = P epsilon - x_0`라는 새 target을 제안합니다.
+
+2. **픽셀 공간 flow matching의 학습 부담 감소**  
+   풀랭크 랜덤 노이즈를 모두 맞추지 않아도 되게 만듭니다.
+
+3. **`x_0`-prediction과 `u`-prediction의 통합 해석**  
+   `r=0`이면 `x_0`-prediction, `r=D`이면 기존 `u`-prediction이 됩니다.
+
+4. **scratch와 pretrained finetune 둘 다 지원**  
+   scratch 학습에서는 PCA, latent-to-pixel finetune에서는 Procrustes alignment로 `A`를 만듭니다.
+
+5. **픽셀 공간 모델의 경쟁력 회복**  
+   ImageNet 256에서 FID 1.57, FLUX.2 klein pixel finetune에서도 강한 T2I 결과를 보입니다.
+
+---
+
+## 15. 한 줄 요약
+
+> **AsymFlow는 flow matching target `u = epsilon - x_0`에서 노이즈 항만 `P epsilon`으로 바꿔, 네트워크가 의미 없는 풀랭크 픽셀 노이즈를 덜 배우게 하고 픽셀 공간 생성 모델의 품질과 수렴 속도를 끌어올린다.**
+
