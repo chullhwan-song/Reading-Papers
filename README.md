@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|
 | 10 | [DreamLite: A Lightweight On-Device Unified Model for Image Generation and Editing](Diffusion/PAPER_DreamLite.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2603.28713) | [github](https://github.com/ByteVisionLab/DreamLite) | 2026-05-22 |
 | 9 | [Any2AnyTryon: Leveraging Adaptive Position Embeddings for Versatile Virtual Clothing Tasks](Diffusion/PAPER_Any2AnyTryon.md) | ICCV 2025 | [arxiv](https://arxiv.org/abs/2501.15891) | [github](https://github.com/logn-2024/Any2anyTryon) | 2026-05-22 |
-| 8 | [Asymmetric Flow Models](Diffusion/PAPER_AsymFlow.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2605.12964) | [github](https://github.com/Lakonik/LakonLab) | 2026-05-20 |
+| 8 | [Asymmetric Flow Models](Diffusion/PAPER_AsymFlow.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2605.12964) | [github](https://github.com/Lakonik/LakonLab) | 2026-05-22 |
 | 7 | [Lumina-Next: Making Lumina-T2X Stronger and Faster with Next-DiT](Diffusion/PAPER_Lumina-Next.md) | arXiv 2024 | [arxiv](https://arxiv.org/abs/2406.18583) | [github](https://github.com/Alpha-VLLM/Lumina-T2X) | 2026-05-18 |
 | 6 | [Efficient Diffusion Training via Min-SNR Weighting Strategy](Diffusion/PAPER_Min-SNR.md) | ICCV 2023 | [arxiv](https://arxiv.org/abs/2303.09556) | [github](https://github.com/TiankaiHang/Min-SNR-Diffusion-Training) | 2026-05-15 |
 | 5 | [SANA: Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers](Diffusion/PAPER_Sana.md) | arXiv 2024 | [arxiv](https://arxiv.org/abs/2410.10629) | [github](https://github.com/NVlabs/Sana) | 2026-05-14 |
