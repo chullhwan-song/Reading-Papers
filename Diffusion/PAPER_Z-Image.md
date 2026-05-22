@@ -1065,6 +1065,124 @@ reward model
 
 이 모든 선택이 6B라는 작은 본체를 중심으로 정렬되어 있습니다.
 
+### Q8. DreamLite와 비교하면 모델 차이가 뭔가?
+
+*핵심 질문: 같은 시기에 나온 다른 "효율" 모델 [[paper_dreamlite]] 과 본 논문은 표제만 비슷한데 실제 설계는 어떻게 다른가.*
+
+**한 줄로**: Z-Image는 **"서버사이드 SOTA를 효율적으로 만들자"** (6B로 20–80B 따라잡기), DreamLite는 **"온디바이스에서 처음으로 통합 모델을 가능하게 하자"** (0.39B로 폰에서 1초 미만). 체급이 약 15배 차이라 직접 벤치 비교 의미 없음.
+
+**핵심 대비 한눈에**:
+
+| 측면 | Z-Image | DreamLite |
+|---|---|---|
+| 타겟 | 서버 GPU (H800) | **스마트폰** |
+| 백본 | Single-Stream DiT (6.15B, 30층) | **Pruned SDXL UNet** (0.39B) |
+| 텍스트 인코더 | Qwen3-4B + SigLIP 2 (편집용 분리) | **Qwen3-VL-2B 하나로 통합** (텍스트+이미지) |
+| VAE | Flux VAE (16ch) | **TinyVAE** (폰 22ms) |
+| Conditioning | **시퀀스 concat (1D)** + 3D RoPE | **공간 concat (2D)** + 태스크 토큰 |
+| Distillation | **Decoupled DMD** (자체) — 50→8 step | **DMD2** (기존) — 28→4 step |
+| RL | **DMDR + 2-stage RLHF** (본격 on-policy) | **ReFL** (가벼움, 베이스라인 위만) |
+| 학습 트릭 | **Active Data Curation** (4-모듈 인프라) | **Foreground-Emphasis Mask + 3단계 커리큘럼** |
+| 무기 | **알고리즘 노벨티** | **시스템 엔지니어링** |
+
+**공통점**: 단일 모델 통합, Qwen 계열 텍스트 인코더, DMD 계열 distillation, CFG-free 변종, 사람 선호 RL — 표제는 같음.
+
+→ **상세 비교**는 [[paper_dreamlite]] 본체 ([PAPER_DreamLite.md Q5](PAPER_DreamLite.md)) 에 정리. 본 절은 짧은 포인터.
+
+### Q9. Z-Image의 고품질 SFT curated data는 공개됐나?
+
+아닙니다. **Z-Image의 SFT curated data 자체는 공개되지 않았습니다.**
+
+공개된 것은 모델 가중치, 추론 코드, 모델 카드, 리포트/논문 설명 정도입니다.
+
+```text
+공개됨:
+  모델 가중치
+  추론 코드
+  모델 카드 / 리포트 / 논문 설명
+
+비공개:
+  SFT curated dataset 원본
+  이미지-캡션 pair 목록
+  최종 SFT 데이터 크기
+  source breakdown
+  Prompt Enhancer 학습 데이터
+  reward model / preference data
+  data curation tooling 전체
+```
+
+다만 데이터 구성 방식에 대한 설명은 있습니다.
+
+| 항목 | 논문/리포트에서 설명된 수준 |
+|---|---|
+| 원천 | large-scale internal copyrighted image-text collections |
+| 필터링 | 해상도, aspect ratio, pHash, 압축 흔적, 품질 점수, 정보량 기준 |
+| 안전/품질 | NSFW 제거, AI-generated content 필터, aesthetic model 사용 |
+| 정렬성 | CN-CLIP으로 image-text alignment 낮은 pair 제거 |
+| 캡션 | tag, short, medium, long, simulated user prompt 등 5종 caption |
+| OCR | long caption에 visible text/OCR 정보 포함 |
+| 지식 그래프 | Wikipedia entity + internal tag로 concept graph 구성 |
+| 샘플링 | BM25 rarity score와 graph 기반 balanced sampling |
+| SFT 목적 | high-fidelity output 쪽으로 distribution narrowing |
+| long-tail 보호 | tagged resampling으로 catastrophic forgetting 방지 |
+| 마무리 | model merging으로 여러 능력 간 Pareto-optimal 지점 탐색 |
+
+따라서 문서에는 이렇게 쓰는 것이 가장 정확합니다.
+
+```text
+Z-Image의 SFT curated data는 비공개다.
+논문은 데이터 원본, 샘플 수, 실제 pair는 공개하지 않는다.
+대신 고품질 필터링, grounded caption, tagged resampling,
+BM25 기반 rarity balancing, model merging 같은 구성 원리는 설명한다.
+```
+
+### Q10. 그럼 비슷한 공개 데이터셋은 무엇이 있나?
+
+Z-Image SFT 데이터와 완전히 같은 수준의 내부 curated dataset이 공개된 것은 아니지만, **비슷한 목적의 공개 데이터셋**은 있습니다.
+
+| 데이터셋 | 공개 여부 | 규모 | Z-Image SFT와의 유사도 | 장점 | 주의점 |
+|---|---:|---:|---|---|---|
+| **Fine-T2I** | 공개 | 6M+ pair, 약 2TB | 매우 높음 | T2I fine-tuning용 대규모 고품질 curated 데이터. Z-Image/FLUX2 등으로 만든 synthetic data + 전문 사진 기반 real data 포함. original/enhanced prompt 제공 | synthetic 비중이 큼. Z-Image가 의도적으로 피한 proprietary/synthetic distillation 계열과 철학이 다를 수 있음 |
+| **Alchemist** | 공개 | 3,350 samples | 매우 높음 | 작지만 SFT 효과를 노린 초고품질 curated 데이터. diffusion model 내부 activation으로 좋은 SFT 샘플을 고르고 VLM recaption 사용 | 규모가 작음. 대규모 general model 학습보다는 SFT 효과 검증/소규모 개선에 가까움 |
+| **LAION-Aesthetics** | 공개 | score threshold별 수백만~억 단위 | 중간 | aesthetic score 기반 공개 image-text pool. LAION-Art(score > 8), LAION-Aesthetic(score > 7) 등으로 필터링 가능 | caption 품질과 alignment가 Z-Image식 SFT 데이터보다 거칠다. 추가 filtering/recaptioning 필요 |
+| **JourneyDB** | 공개 | 4M generated image-prompt | 중간 | 고품질 generated image와 prompt 쌍. style/prompt 연구와 generated image understanding에 유용 | 원래 목적은 T2I SFT라기보다 benchmark/understanding 쪽. 생성 모델 편향이 들어 있음 |
+| **DiffusionDB** | 공개 | 14M image-prompt | 낮음~중간 | Stable Diffusion Discord 기반 대규모 real user prompt-image 로그. CC0로 설명됨 | 고품질 curated SFT 데이터가 아니라 사용 로그에 가깝다. 노이즈, 편향, prompt 품질 차이가 큼 |
+| **ShareGPT4V** | 공개 | 100K GPT-4V captions / 1.2M generated captions | 보조적으로 높음 | 매우 자세한 image caption 데이터. object property, spatial relation, world knowledge, aesthetic description 포함 | T2I SFT용 image-prompt pair라기보다 captioner/LMM 학습용. 원천 이미지와 라이선스 확인 필요 |
+| **SFHQ-T2I** | 공개 | 122K face image-prompt | 도메인 한정 | 고품질 1024x1024 synthetic face image와 prompt. 얼굴 도메인에서는 품질과 다양성이 좋음 | 얼굴 전용이라 general T2I SFT에는 좁다. 여러 생성 모델로 만든 synthetic 데이터 |
+
+가장 가까운 공개 대안만 고르면:
+
+```text
+1순위: Fine-T2I
+  대규모, T2I fine-tuning 목적, 고품질 filtering, enhanced prompt 포함
+
+2순위: Alchemist
+  작지만 SFT용 고품질 curated dataset 철학이 가장 선명함
+
+보조 후보:
+  LAION-Aesthetics + ShareGPT4V captioning
+  JourneyDB / DiffusionDB를 재필터링해서 사용
+```
+
+Z-Image식으로 공개 데이터를 만들려면 단순히 위 데이터셋을 그대로 쓰기보다는 아래 과정이 필요합니다.
+
+```text
+1. 원천 후보 수집
+2. aesthetic / quality / safety / watermark / alignment 필터링
+3. VLM 또는 captioner로 grounded recaption
+4. OCR과 visible text를 caption에 포함
+5. concept tag 부여
+6. rare concept을 tagged resampling으로 보존
+7. 여러 SFT checkpoint를 비교하거나 model merging
+```
+
+즉:
+
+```text
+Fine-T2I, Alchemist는 "이미 SFT용 curated data"에 가깝고,
+LAION-Aesthetics, JourneyDB, DiffusionDB는 "SFT 데이터로 만들 수 있는 원천 후보"에 가깝다.
+```
+
 ---
 
 ## 16. 최종 요약
