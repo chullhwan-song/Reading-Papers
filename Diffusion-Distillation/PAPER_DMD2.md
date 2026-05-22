@@ -216,7 +216,31 @@ DMD2는 DMD의 후속작입니다. 그래서 DMD2의 설계를 이해하려면 D
 
 DMD는 student 출력 분포가 teacher 분포와 같아지도록 학습합니다.
 
-학습 신호는 대략 이렇게 생겼습니다.
+먼저 diffusion score의 기본 수식부터 보면:
+
+```math
+s(x_t, t)
+= \nabla_{x_t} \log p_t(x_t)
+= -\frac{x_t - \alpha_t \mu(x_t, t)}{\sigma_t^2}
+```
+
+기호를 풀면:
+
+| 기호 | 뜻 |
+|---|---|
+| `x_t` | clean image `x₀`에 timestep `t`만큼 noise를 섞은 latent |
+| `p_t(x_t)` | timestep `t`에서 noisy latent들이 따르는 분포 |
+| `s(x_t,t)` | 그 분포의 score. 즉, `x_t` 위치에서 밀도가 높아지는 방향 |
+| `μ(x_t,t)` | diffusion model이 예측한 denoised image, 보통 `x̂₀`에 해당 |
+| `α_t`, `σ_t` | noise schedule이 정하는 clean 성분과 noise 성분의 계수 |
+
+직관적으로는:
+
+```text
+score = "이 noisy latent가 더 그럴듯한 이미지 분포 쪽으로 가려면 어느 방향으로 움직여야 하는가?"
+```
+
+DMD의 핵심 학습 신호는 이 score 두 개의 차이입니다.
 
 ```text
 teacher score - fake score
@@ -234,6 +258,60 @@ grad ~= p_real - p_fake
 2. Critic이 현재 student 분포 방향을 알려준다.
 3. 둘의 차이로 student를 이동시킨다.
 
+논문 수식으로 쓰면 DMD gradient는 다음 형태입니다.
+
+```math
+\nabla_\theta \mathcal{L}_{\mathrm{DMD}}
+=
+\mathbb{E}_t
+\left[
+\nabla_\theta
+\mathrm{KL}
+\left(
+p_{\mathrm{fake},t}
+\Vert
+p_{\mathrm{real},t}
+\right)
+\right]
+```
+
+```math
+\approx
+-
+\mathbb{E}_{t,z}
+\left[
+\left(
+s_{\mathrm{real}}(x_t,t)
+-
+s_{\mathrm{fake}}(x_t,t)
+\right)
+\frac{\partial G_\theta(z)}{\partial \theta}
+\right],
+\quad
+x_t = F(G_\theta(z), t)
+```
+
+여기서:
+
+| 기호 | 뜻 |
+|---|---|
+| `z ~ N(0,I)` | student에 넣는 random noise |
+| `G_θ(z)` | student가 만든 clean latent |
+| `F(G_θ(z),t)` | student 출력에 timestep `t`만큼 noise를 다시 섞는 forward diffusion |
+| `p_fake,t` | student 출력에 noise를 섞은 분포 |
+| `p_real,t` | real/teacher image에 noise를 섞은 분포 |
+| `s_real` | frozen teacher가 주는 real score |
+| `s_fake` | critic `μ_fake`가 주는 fake score |
+
+이 수식의 의미는 어렵지 않습니다.
+
+```text
+student가 만든 지점 x_t에서
+teacher는 어느 방향이 real 같다고 보는지 보고,
+critic은 어느 방향이 student가 자주 가는 곳인지 보고,
+그 차이만큼 G_θ를 업데이트한다.
+```
+
 ### 5.2 그런데 DMD는 `L_reg`라는 안전벨트가 필요했다
 
 DMD 원작은 분포 매칭만으로 학습하면 불안정해질 수 있어서 `L_reg`를 추가했습니다.
@@ -245,6 +323,28 @@ DMD 원작은 분포 매칭만으로 학습하면 불안정해질 수 있어서 
 ```text
 L_reg = || G_θ(z) - teacher_output(z) ||^2
 ```
+
+논문식으로는 보통 이렇게 씁니다.
+
+```math
+\mathcal{L}_{\mathrm{reg}}
+=
+\mathbb{E}_{(z,y)\sim \mathcal{D}}
+\left[
+\ell(G_\theta(z), y)
+\right]
+```
+
+여기서:
+
+| 기호 | 뜻 |
+|---|---|
+| `𝒟` | 미리 만들어 둔 paired dataset |
+| `z` | teacher sampling을 시작한 noise |
+| `y` | 같은 `z`에서 teacher를 여러 step 돌려 얻은 이미지 |
+| `ℓ` | 거리 함수. MSE, LPIPS 같은 regression loss |
+
+즉 `L_reg`는 "분포만 비슷하면 된다"가 아니라, **같은 noise `z`에서는 teacher가 만든 특정 이미지 `y`와 student 출력이 직접 가까워야 한다**는 제약입니다.
 
 이 손실은 안정성에는 도움이 됩니다. 하지만 큰 문제가 있습니다.
 
@@ -451,6 +551,43 @@ student는 fake를 real처럼 보이게 학습
 - guidance_cls_loss
 ```
 
+논문에서 GAN objective는 다음처럼 쓸 수 있습니다.
+
+```math
+\mathcal{L}_{\mathrm{GAN}}
+=
+\mathbb{E}_{x\sim p_{\mathrm{real}},\,t}
+\left[
+\log D(F(x,t))
+\right]
++
+\mathbb{E}_{z\sim p_{\mathrm{noise}},\,t}
+\left[
+-\log D(F(G_\theta(z),t))
+\right]
+```
+
+기호를 풀면:
+
+| 기호 | 뜻 |
+|---|---|
+| `D(·)` | real/fake를 판단하는 discriminator head |
+| `x ~ p_real` | 진짜 이미지 또는 진짜 latent |
+| `G_θ(z)` | student가 만든 fake image latent |
+| `F(·,t)` | timestep `t`만큼 noise를 섞는 forward diffusion |
+| `D(F(x,t))` | noise가 섞인 real image를 real로 볼 확률 |
+| `D(F(G_θ(z),t))` | noise가 섞인 fake image를 real로 볼 확률 |
+
+이 식을 말로 풀면:
+
+```text
+real image에 noise를 섞은 것은 real로 판단하게 하고,
+student image에 noise를 섞은 것은 fake로 판단하게 한다.
+student는 반대로 자기 이미지가 real처럼 판단되도록 학습한다.
+```
+
+여기서 noise를 다시 섞는 이유는 Diffusion-GAN 스타일 안정화입니다. Discriminator가 깨끗한 이미지의 미세한 texture shortcut만 보고 판별하지 않게 만들고, 더 큰 구조와 분포 차이를 보게 하려는 장치입니다.
+
 ### 9.3 GAN loss의 역할
 
 GAN loss는 DMD2의 메인 손실이라기보다 보조 신호입니다.
@@ -526,6 +663,42 @@ x̂₀에 forward noising을 다시 적용해서 다음 timestep 입력 생성
 
 즉, step 간 이동은 학습된 reverse solver가 아니라 단순 forward noising 공식으로 합니다.
 
+수식으로 쓰면 한 step은 이렇게 볼 수 있습니다.
+
+```math
+\hat{x}_0^{(i)} = G_\theta(x_{t_i}, t_i)
+```
+
+```math
+x_{t_{i+1}}
+=
+F(\hat{x}_0^{(i)}, t_{i+1})
+=
+\alpha_{t_{i+1}}\hat{x}_0^{(i)}
++
+\sigma_{t_{i+1}}\epsilon_i,
+\quad
+\epsilon_i \sim \mathcal{N}(0,I)
+```
+
+기호를 풀면:
+
+| 기호 | 뜻 |
+|---|---|
+| `t_i` | 현재 step의 timestep. 예: 999 |
+| `G_θ(x_{t_i},t_i)` | 현재 noisy latent에서 clean latent `x̂₀`를 직접 예측 |
+| `t_{i+1}` | 다음 step의 timestep. 예: 749 |
+| `F(x̂₀,t_{i+1})` | 예측한 clean latent에 다시 noise를 섞어 다음 step 입력 생성 |
+| `ε_i` | 매 step 새로 뽑는 Gaussian noise |
+
+중요한 점은 이것입니다.
+
+```text
+DMD2 multi-step은 teacher의 reverse solver를 따라가는 것이 아니라,
+student가 매 step x̂₀를 예측하고,
+그 x̂₀를 다시 forward noising해서 다음 입력을 만든다.
+```
+
 ```python
 noisy_image = scheduler.add_noise(generated_image, randn_like, next_timestep)
 ```
@@ -572,6 +745,30 @@ DMD2는 학습 중에도 추론 상황을 일부러 만들어냅니다.
 2. pure noise에서 시작해 student를 `k`번째 위치까지 no_grad로 굴립니다.
 3. 그렇게 만들어진 "추론 중간 상태"에서만 gradient를 계산합니다.
 
+수식처럼 쓰면 다음과 같습니다.
+
+```math
+k \sim \mathrm{Uniform}\{0,1,\dots,K-1\}
+```
+
+```math
+x_{t_0} \sim \mathcal{N}(0,I)
+```
+
+```math
+\hat{x}_0^{(i)} = G_\theta(x_{t_i},t_i),
+\quad
+x_{t_{i+1}} = F(\hat{x}_0^{(i)},t_{i+1}),
+\quad
+i < k
+```
+
+```math
+\text{loss는 } x_{t_k} \text{에서 한 번만 계산한다.}
+```
+
+여기서 `i < k` 구간은 `no_grad`로 굴립니다. 즉, 학습하려는 건 전체 4-step trajectory가 아니라 **랜덤하게 고른 한 위치의 한 step**입니다.
+
 그림으로 보면:
 
 ```text
@@ -617,6 +814,34 @@ Generator가 학습될 때는 두 손실이 들어갑니다.
 L_G = distribution matching loss + 0.005 * generator GAN loss
 ```
 
+수식으로는 다음처럼 생각하면 됩니다.
+
+```math
+\mathcal{L}_{G}
+=
+\mathcal{L}_{\mathrm{DMD}}
++
+\lambda_{\mathrm{G}}
+\mathcal{L}_{\mathrm{GAN}}^{G}
+```
+
+```math
+\mathcal{L}_{\mathrm{GAN}}^{G}
+=
+\mathbb{E}_{z,t}
+\left[
+-\log D(F(G_\theta(z),t))
+\right]
+```
+
+DMD2 SDXL 코드에서는 보통:
+
+```text
+λ_G = gen_cls_loss_weight = 5e-3
+```
+
+입니다.
+
 역할:
 
 ```text
@@ -634,6 +859,63 @@ Critic은 매 step 학습됩니다.
 ```text
 L_D = fake denoising loss + 0.01 * real/fake classification loss
 ```
+
+수식으로는 다음처럼 볼 수 있습니다.
+
+```math
+\mathcal{L}_{\mu_{\mathrm{fake}}}
+=
+\mathcal{L}_{\mathrm{denoise}}^{\mathrm{fake}}
++
+\lambda_{\mathrm{D}}
+\mathcal{L}_{\mathrm{GAN}}^{D}
+```
+
+fake score estimator의 denoising loss는 표준 diffusion 학습식과 같습니다.
+
+```math
+\mathcal{L}_{\mathrm{denoise}}^{\mathrm{fake}}
+=
+\mathbb{E}_{z,t,\epsilon}
+\left[
+\left\|
+\epsilon
+-
+\epsilon_{\mu_{\mathrm{fake}}}
+\left(
+F(G_\theta(z),t), t
+\right)
+\right\|_2^2
+\right]
+```
+
+GAN discriminator 쪽은 real은 real로, fake는 fake로 분류하도록 학습합니다.
+
+```math
+\mathcal{L}_{\mathrm{GAN}}^{D}
+=
+-
+\mathbb{E}_{x\sim p_{\mathrm{real}},t}
+\left[
+\log D(F(x,t))
+\right]
+-
+\mathbb{E}_{z,t}
+\left[
+\log
+\left(
+1-D(F(G_\theta(z),t))
+\right)
+\right]
+```
+
+DMD2 SDXL 코드에서는 보통:
+
+```text
+λ_D = guidance_cls_loss_weight = 1e-2
+```
+
+입니다.
 
 역할:
 
