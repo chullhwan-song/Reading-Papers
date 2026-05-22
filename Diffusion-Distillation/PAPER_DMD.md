@@ -1,404 +1,904 @@
-# PAPER: DMD (Distribution Matching Distillation) — 1-step Diffusion 의 분포 매칭 증류
+# PAPER: DMD - One-step Diffusion with Distribution Matching Distillation 쉽게 읽기
 
-## 📌 메타 정보
+## 0. 이 문서를 읽는 법
+
+이 문서는 DMD 논문을 처음 읽는 사람이 흐름을 놓치지 않도록 다시 정리한 리뷰입니다.
+
+핵심 목표는 하나입니다.
+
+> **DMD는 느린 diffusion teacher가 여러 step에 걸쳐 만들던 이미지를, student generator가 1-step으로 만들도록 증류하는 방법이다.**
+
+DMD2 문서와 같이 읽는다면 이렇게 보면 좋습니다.
+
+```text
+DMD  = 분포 매칭 증류의 원형. L_reg라는 안전벨트가 있음.
+DMD2 = DMD의 L_reg를 제거하고 TTUR, GAN loss, backward simulation으로 확장.
+```
+
+이 문서는 아래 순서로 읽으면 편합니다.
+
+1. DMD가 해결하려는 문제
+2. 등장인물: `G_θ`, teacher, critic `μ_fake`
+3. Figure 2로 보는 전체 학습 구조
+4. 핵심 수식: score, KL gradient, surrogate loss, `L_reg`
+5. 실제 학습 루프
+6. DMD와 CFG distillation 차이
+7. 실험 결과와 FAQ
+
+---
+
+## 1. 메타 정보
 
 | 항목 | 내용 |
 |---|---|
-| **논문 제목 (메인)** | One-step Diffusion with Distribution Matching Distillation |
-| **저자** | Tianwei Yin, Michaël Gharbi, Richard Zhang, Eli Shechtman, Fredo Durand, William T. Freeman, Taesung Park (MIT + Adobe) |
-| **공개일** | 2023-11-30 (arXiv v1) / CVPR 2024 |
-| **분야** | 이미지 생성 / Diffusion Distillation / cs.CV |
-| **논문 링크** | https://arxiv.org/abs/2311.18828 |
-| **본 문서 목적** | DMD 의 이론·메커니즘 정리 (관련 계열은 비교 맥락에서만 언급) |
-
-### 관련 논문 메타데이터
-
-| 역할 | 논문 | 저자 · 학회 | arXiv |
-|---|---|---|---|
-| **메인** | DMD: One-step Diffusion with Distribution Matching Distillation | Yin et al., CVPR 2024 | 2311.18828 |
-| **후속 (DMD2)** | Improved Distribution Matching Distillation for Fast Image Synthesis | Yin et al., NeurIPS 2024 | 2405.14867 |
-| **이론적 상위 (VSD)** | ProlificDreamer — Variational Score Distillation | Wang et al., NeurIPS 2023 | 2305.16213 |
-| **비교 (CFG distill)** | On Distillation of Guided Diffusion Models | Meng et al., CVPR 2023 | 2210.03142 |
-| **수학적 프레임** | Flow Matching for Generative Modeling | Lipman et al., ICLR 2023 | 2210.02747 |
+| 논문 | One-step Diffusion with Distribution Matching Distillation |
+| 저자 | Tianwei Yin, Michael Gharbi, Richard Zhang, Eli Shechtman, Fredo Durand, William T. Freeman, Taesung Park |
+| 학회 | CVPR 2024 |
+| arXiv | https://arxiv.org/abs/2311.18828 |
+| 프로젝트 페이지 | https://tianweiy.github.io/dmd/ |
+| 후속 논문 | DMD2: Improved Distribution Matching Distillation for Fast Image Synthesis, NeurIPS 2024 |
 
 ---
 
-## 📖 주요 용어 사전 (Glossary)
+## 2. 한 문장 요약
 
-### Diffusion / Flow Matching 기본
+> **DMD는 student가 만든 이미지 분포 `p_fake_θ`를 teacher/real 이미지 분포 `p_real`에 맞추기 위해, teacher score와 fake score의 차이를 generator에 역전파하는 1-step diffusion distillation 방법이다.**
 
-- **Diffusion 모델**: 깨끗한 이미지에 노이즈를 점점 섞었다가, 거꾸로 노이즈를 한 단계씩 걷어내며 이미지를 만드는 생성 모델.
-- **Score (스코어)**: 어떤 분포의 log-density 를 입력으로 미분한 값. `s(x) = ∇_x log p(x)`. "지금 점에서 데이터 밀도가 더 높은 쪽이 어디인가" 를 가리키는 방향 벡터.
-- **ε (epsilon, 엡실론)**: 표준 정규 노이즈 `N(0, I)`. 모델이 예측하는 대상이 되기도 함 (ε-prediction).
-- **velocity (속도, v)**: Flow Matching 정의에서 `v = ε − x₀`. "현재 노이즈 섞인 점에서 깨끗한 이미지 쪽으로 가야 할 방향".
-- **x_t**: timestep t 의 latent (중간 상태). 깨끗한 이미지 x₀ 와 노이즈 ε 를 σ 비율로 섞은 값.
-- **σ (sigma, 시그마)**: 노이즈 강도. 0 = clean, 1 = 순수 노이즈.
-- **Flow Matching**: 노이즈와 진짜 이미지를 t 비율로 섞은 점을 만들고, 그 점에서 진짜 방향으로 향하는 속도 벡터를 학습하는 방식. Rectified Flow (RF) 가 대표적 특수형이고 FLUX·SD3 가 사용.
-- **Euler step**: `x_{σ'} = x_σ + (σ' − σ) · v(x_σ, σ)`. 미분방정식(ODE)을 가장 단순한 방법으로 한 칸 적분하는 식.
+조금 더 쉽게 말하면:
 
-### Distillation (증류) 관련
-
-- **Distillation (증류)**: 큰 모델(teacher) 의 동작을 작은/빠른 모델(student) 이 흉내내도록 학습 → 추론 step 수나 forward (모델 한 번 통과) 횟수를 줄이는 가속 기법.
-- **Teacher / Student**: 증류의 두 주체. Teacher 는 **학습 안 함 (frozen, 가중치 동결)**, Student 만 학습.
-- **CFG (Classifier-Free Guidance, 분류기 없는 안내)**: 텍스트 조건이 적용된 결과(`v_cond`)와 빈 텍스트 결과(`v_uncond`)를 섞어 prompt (지시문) 강도를 키우는 표준 기법. 한 step 에 forward 2번 필요.
-- **CFG distillation (Meng et al. 2023)**: teacher 의 CFG output (안내된 출력) 을 student 가 forward 1번으로 흉내내도록 학습. step 수는 그대로(예: 50), forward 만 1번이 됨 → 추론 2× 가속.
-- **Score Distillation (스코어 증류)**: teacher 와 student 의 "score" 자체를 맞추는 증류. DMD 가 대표.
-- **VSD (Variational Score Distillation, 변분 스코어 증류, Wang 2023)**: ProlificDreamer 에서 제안. 두 score 의 차이를 generator (생성기) 로 역전파 (back-propagation = 출력에서 입력 방향으로 그래디언트 흘리기) 하는 방식. DMD 의 이론적 모태.
-- **KL divergence (`D_KL(p ‖ q)`, KL 발산)**: 두 분포의 차이 척도. 0 이면 완전 동일.
-- **MSE (Mean Squared Error, 평균 제곱 오차)**: `‖예측값 − 정답‖²` 의 평균. 가장 단순한 회귀 손실 (regression loss).
-- **regression loss (회귀 손실)**: 모델 출력과 미리 준비된 정답 쌍 사이의 MSE 형태 손실.
-- **autograd (자동 미분)**: PyTorch 등에서 손실 함수를 정의하면 자동으로 그래디언트를 흘려주는 기능.
-- **surrogate (대리 함수)**: 원래 계산하고 싶은 식이 너무 어려울 때, **같은 그래디언트를 주는 더 쉬운 식** 으로 대체한 것.
-- **detach (분리)**: PyTorch 의 `.detach()` — 그래디언트가 그 변수로 흐르지 못하게 막음 ("여기서 끊어라").
-- **LoRA (Low-Rank Adaptation, 저차원 어댑터)**: 거대 모델의 일부 층에 작은 추가 모듈을 붙여 그것만 학습하는 경량 fine-tuning (미세조정) 기법.
-- **ablation (구성요소 제거 실험)**: 각 모듈을 하나씩 빼 보고 성능이 얼마나 떨어지는지 보는 실험 — 어떤 모듈이 진짜 중요한지 확인하는 표준 방식.
-
-### DMD 핵심 구성요소
-
-- **Generator G_θ (생성기)**: student. 본 논문에서는 `z → x₀` 의 **1-step 직사상 (direct mapping = 한 번에 바로 매핑)** 함수.
-- **p_real**: teacher 가 (학습 데이터를 통해) 암묵적으로 표현하는 정답 분포.
-- **p_fake_θ**: student 가 만들어내는 샘플의 분포.
-- **s_real(x_t, t)**: p_real 의 score. teacher 의 ε-prediction / v-prediction (노이즈/속도 예측) 에서 유도.
-- **s_fake(x_t, t)**: p_fake 의 score. **별도의 critic 네트워크 μ_fake (판별기 역할이 아니라 "스코어 추정기" 역할)** 가 student 출력을 **forward-diffuse (다시 노이즈 씌우기)** 시켜 학습.
-- **μ_fake (fake-score critic, 가짜 분포 스코어 추정기)**: DMD 의 가장 큰 특징. 학습 중에 student 와 함께 따로 업데이트되는 두 번째 네트워크. (단순 MSE 증류엔 없음)
-- **L_reg (regression loss, 회귀 손실)**: teacher 의 ODE (미분방정식) 로 만든 **paired (입력-정답 쌍) `(z, x₀)`** 데이터에 대한 student MSE. DMD 안정화의 결정적 요소 (ablation Table 2 = 구성요소 제거 실험).
-- **Distribution Matching Gradient (분포 매칭 그래디언트)**: DMD 핵심 식. `∇_θ KL(p_fake ‖ p_real)` 을 두 score 의 차 `(s_fake − s_real)` 로 근사.
-
-### 평가 지표 (Metrics)
-
-- **FID (Fréchet Inception Distance)**: 생성된 이미지들과 실제 이미지들의 통계적 분포 거리. **낮을수록 좋음** (= 더 진짜 같음). 표준 이미지 품질 지표.
-- **NFE (Number of Function Evaluations, 모델 호출 횟수)**: 한 이미지 만들기 위해 모델을 몇 번 통과시켰는지. 50-step diffusion + CFG = NFE 100.
-- **CLIP score (CLIP 점수)**: OpenAI 의 CLIP 모델로 잰 **이미지-텍스트 일치도** (높을수록 prompt 를 잘 따랐다는 뜻).
-- **EDM**: Elucidating Diffusion Models (Karras et al. 2022) — DMD 의 teacher 로 자주 쓰인 강력한 diffusion 모델.
-- **SDv1.5**: Stable Diffusion v1.5 — 대표 text-to-image (텍스트→이미지) 모델. DMD 의 LAION 실험에서 teacher 역할.
+> **teacher가 "진짜 이미지 분포는 이쪽이야"라고 알려주고, critic이 "지금 student는 이쪽에 몰려 있어"라고 알려주면, DMD는 그 차이를 이용해 student를 real 분포 쪽으로 밀어준다.**
 
 ---
 
-## 1️⃣ 논문 한눈에 보기 (TL;DR)
+## 3. DMD가 해결하려는 문제
 
-> Diffusion 모델은 노이즈에서 이미지를 만들기까지 **50~1000 번 모델을 통과시키는 적분 (= ODE step 으로 한 칸씩 나아가기)** 이 필요해 느린데, **teacher 의 분포 자체를 student 가 모방** 하도록 학습하면 단 한 번의 통과 (1 step) 만으로도 비슷한 품질이 나온다. 핵심 아이디어는 *KL divergence 의 gradient = (s_fake − s_real) 의 차분 (두 score 의 뺄셈)* 이라는 점을 이용해 student 를 미는 것. 결과: ImageNet 64×64 에서 **FID (Fréchet Inception Distance, 이미지 품질 거리 — 낮을수록 좋음) 2.62** (teacher EDM 의 1.79 와 작은 갭), A100 GPU 한 장에서 이미지 한 장당 0.09 초.
+일반 diffusion 모델은 이미지를 만들 때 여러 번 모델을 호출합니다.
 
-**핵심 문제**: Diffusion 의 N-step 적분 비용 (= 모델을 N번 통과시키며 노이즈를 걷어내는 비용) 을 어떻게 1-step (한 번에 바로) 으로 줄이면서도 품질을 살릴 것인가?
+```text
+noise
+  -> denoise
+  -> denoise
+  -> denoise
+  -> ...
+  -> image
+```
 
-**해결책 (3 요소)**:
-1. **Distribution Matching gradient (분포 매칭 그래디언트)** — *(즉: KL 의 미분값이 두 score 의 차이로 표현된다는 사실을 이용)* `∇_θ KL(p_fake ‖ p_real) ≈ E[(s_fake − s_real) · ∂x/∂θ]`. 두 score (분포의 경사 벡터) 의 차이로 generator (생성기) 를 민다.
-2. **Real / Fake 두 개의 score 네트워크** — `s_real` 은 **frozen teacher (가중치 고정된 선생)**, `s_fake` 는 student 출력으로 새로 학습되는 **critic μ_fake (가짜 분포의 스코어 추정기)**.
-3. **Regression loss L_reg (회귀 손실 = 정답 쌍 MSE)** — teacher 의 ODE 로 **paired data (입력-정답 쌍)** 만들어 학습 안정화. (없으면 FID 11.49 → 19+ 로 폭락)
+좋은 품질을 얻으려면 50 step, 100 step, 때로는 그 이상이 필요합니다. CFG까지 쓰면 한 step에 conditional/unconditional forward를 둘 다 호출하므로 비용이 더 커집니다.
 
-**검증**:
-- ImageNet 64×64 (1-step, 한 번 통과) : FID **2.62** vs teacher EDM (Karras et al. 2022) 의 1.79
-- LAION COCO-30k (1-step, text-to-image) : FID **11.49**, CLIP score (이미지-텍스트 일치도) 0.320
-- 속도 : A100 GPU 에서 이미지 한 장당 0.09 초 (1-step)
+DMD의 목표는 이것입니다.
+
+```text
+teacher: many-step diffusion
+student: one-step generator
+```
+
+즉:
+
+```text
+z -> G_θ(z) -> x̂₀
+```
+
+한 번의 forward로 이미지를 만들게 하려는 것입니다.
+
+여기서 중요한 점은 DMD가 teacher의 각 step을 그대로 따라 하려는 방법이 아니라는 것입니다.
+
+```text
+나쁜 이해:
+  teacher의 50-step trajectory를 1-step으로 압축해서 똑같이 따라 한다
+
+더 정확한 이해:
+  student가 만들어내는 이미지들의 전체 분포가 teacher/real 분포와 같아지도록 학습한다
+```
+
+그래서 이름이 **Distribution Matching Distillation**입니다.
 
 ---
 
-## 2️⃣ 핵심 기여 (Contributions)
+## 4. 등장인물 정리
 
-1. **1-step diffusion sampling 의 실용적 입증** — teacher 와 큰 품질 차이 없이 **noise → image 직사상 (direct mapping = 노이즈에서 이미지로 한 번에 매핑)** 이 가능함을 **large-scale text-to-image (대규모 텍스트→이미지)** 까지 확장 검증.
-2. **분포 매칭 (Distribution Matching) gradient 의 명시화** — KL 을 직접 줄이기 어려운 문제를, **score 차분 surrogate (대리 함수 — 같은 그래디언트를 주는 더 쉬운 식)** 로 해결. **autograd (자동 미분) 호환 형태** 로 구현. 핵심 트릭은 *"x̂₀ 에서 미리 계산된 grad 방향으로 한 발짝 간 점을 detach (그래디언트 차단) 한 뒤 MSE 를 잡으면, 그 MSE 의 미분이 자동으로 원하는 grad 가 되도록 만든 것"*:
-   ```
-   L = 0.5 · ‖x̂₀ − (x̂₀ − grad).detach()‖²
-   ```
-3. **Real score + Fake score 분리 구조 정착** — VSD (Variational Score Distillation, 변분 스코어 증류) 의 이미지 생성 본격 적용. 후속 **DMD2 / SDXS / Hyper-SD (모두 빠른 diffusion 증류 후속 연구)** 등의 원형이 됨.
-4. **Regression loss 의 ablation (구성요소 제거 실험) 입증** — pure score-matching distillation (오로지 스코어만 맞추는 증류) 의 불안정성을 **paired regression (정답 쌍 회귀 손실)** 으로 해결. 후속 DMD2 가 이를 다시 제거해 품질 상한을 푸는 등 후속 연구의 출발선.
+### 4.1 Student generator, `G_θ`
+
+논문에서 student generator는 **`G_θ`**로 씁니다.
+
+여기서 `θ`는 student 신경망의 학습 파라미터, 즉 weights입니다.
+
+DMD의 student는 1-step generator입니다.
+
+```text
+G_θ(z) -> x̂₀
+```
+
+| 기호 | 뜻 |
+|---|---|
+| `z` | random noise |
+| `G_θ` | 학습되는 student generator |
+| `x̂₀` | student가 한 번에 만든 clean image 또는 latent |
+
+### 4.2 Real distribution, `p_real`
+
+`p_real`은 teacher 또는 real dataset이 나타내는 이미지 분포입니다.
+
+쉽게 말하면:
+
+```text
+진짜 같고 좋은 이미지들이 이미지 공간에서 어디에 모여 있는가
+```
+
+를 나타내는 분포입니다.
+
+### 4.3 Fake distribution, `p_fake_θ`
+
+`p_fake_θ`는 student가 만든 한 장의 이미지가 아닙니다.
+
+정확히는:
+
+> **현재 student `G_θ`에 여러 noise `z`를 넣었을 때 나오는 모든 이미지들의 분포**
+
+예를 들어:
+
+```text
+z1 -> G_θ -> dog-like image
+z2 -> G_θ -> blurry face
+z3 -> G_θ -> landscape
+...
+```
+
+이 출력들이 이미지 공간 어디에 얼마나 모이는지의 패턴이 `p_fake_θ`입니다.
+
+학습이 진행되면 `θ`가 바뀌므로 `p_fake_θ`도 계속 바뀝니다.
+
+### 4.4 Teacher score, `s_real`
+
+Teacher score는 `p_real`의 방향 신호입니다.
+
+```text
+s_real(x_t,t)
+= "이 noisy latent 위치에서 real 분포 쪽으로 가려면 어느 방향인가?"
+```
+
+Teacher는 이미 학습된 diffusion model이며, DMD 학습 중에는 frozen입니다.
+
+### 4.5 Fake score critic, `μ_fake`
+
+DMD에서 가장 중요한 추가 네트워크입니다.
+
+한 줄 정의:
+
+> **`μ_fake`는 현재 student 분포 `p_fake_θ`의 score를 추정하는 보조 diffusion 모델이다.**
+
+중요한 점:
+
+```text
+μ_fake는 GAN discriminator가 아니다.
+real/fake 확률을 내는 판별기가 아니라,
+student 분포의 score 방향을 알려주는 score estimator다.
+```
+
+Teacher가 real 분포의 score를 알려주듯, `μ_fake`는 fake 분포의 score를 알려줍니다.
+
+```text
+s_real = teacher/real 분포의 방향
+s_fake = student/fake 분포의 방향
+```
+
+DMD는 이 둘의 차이로 student를 업데이트합니다.
 
 ---
 
-## 3️⃣ 주요 알고리즘 설명
+## 5. Diffusion score를 먼저 이해하기
 
-### 3.1 학습 흐름 (DMD 원논문, Yin 2024 CVPR)
+DMD의 핵심 수식은 score에서 시작합니다.
 
-**원논문 Fig.2 — 전체 framework 한 장 요약**:
+```math
+s(x_t,t)
+=
+\nabla_{x_t}\log p_t(x_t)
+```
+
+기호를 풀면:
+
+| 기호 | 뜻 |
+|---|---|
+| `x_t` | clean image `x₀`에 timestep `t`만큼 noise를 섞은 상태 |
+| `p_t(x_t)` | timestep `t`에서 noisy image들이 따르는 분포 |
+| `log p_t(x_t)` | 현재 위치 `x_t`가 얼마나 그럴듯한지의 로그 밀도 |
+| `s(x_t,t)` | 그 로그 밀도가 가장 빠르게 커지는 방향 |
+
+와닿게 말하면 score는 **이미지 공간 위의 길 안내 화살표**입니다.
+
+```text
+현재 위치 = x_t
+산의 높이 = log p_t(x_t), 즉 이 위치가 얼마나 그럴듯한지
+score = 가장 가파르게 높아지는 방향
+```
+
+그래서 score는 정답 이미지를 직접 주는 값이 아닙니다.
+
+```text
+정답 이미지 X
+그럴듯한 이미지 분포 쪽으로 가는 방향 O
+```
+
+DMD에서는 이 score를 두 종류로 씁니다.
+
+```text
+s_real:
+  teacher가 알려주는 real 분포 방향
+
+s_fake:
+  μ_fake가 알려주는 현재 student 분포 방향
+```
+
+이 둘의 차이를 보면 student를 어떻게 옮겨야 할지 알 수 있습니다.
+
+```text
+student가 너무 자주 만드는 방향에서는 빠져나오고,
+teacher/real 분포가 좋아하는 방향으로 이동한다.
+```
+
+---
+
+## 6. Figure 2로 보는 DMD 전체 구조
+
+논문 Figure 2가 DMD의 전체 학습 구조를 가장 잘 보여줍니다.
 
 <p align="center">
-  <img src="figures/dmd_fig2.png" alt="DMD Framework Overview (Fig. 2)" width="900"/>
+  <img src="figures/dmd_fig2.png" alt="DMD framework overview" width="900"/>
 </p>
 
-*Source: Yin et al., "One-step Diffusion with Distribution Matching Distillation", CVPR 2024 (project page: tianweiy.github.io/dmd)*
+그림은 크게 왼쪽과 오른쪽으로 나누어 읽으면 됩니다.
 
-**그림 읽는 법** (왼쪽 → 오른쪽):
+### 6.1 왼쪽: one-step generator와 regression loss
 
-| 영역 (그림 내 표기) | 역할 |
+왼쪽은 student generator `G_θ`입니다.
+
+```text
+random latent z -> G_θ -> fake image x̂₀
+```
+
+DMD는 이 fake image에 두 종류의 학습 신호를 줍니다.
+
+첫 번째가 `L_reg`입니다.
+
+```text
+teacher가 미리 만든 paired target image와 student 출력을 MSE로 맞춘다.
+```
+
+이 손실은 DMD의 안정화 장치입니다. DMD2에서는 이 장치를 제거하려고 여러 개선을 넣지만, DMD 원논문에서는 매우 중요합니다.
+
+### 6.2 오른쪽: distribution matching gradient
+
+오른쪽은 DMD의 핵심입니다.
+
+Student가 만든 clean image `x̂₀`를 그대로 score network에 넣지 않습니다. 먼저 다시 noise를 섞습니다.
+
+```text
+x̂₀ -> forward diffusion -> x_t
+```
+
+왜 다시 noise를 섞을까요?
+
+Diffusion score network는 clean image가 아니라 noisy image `x_t`를 입력으로 score를 추정하도록 학습되어 있기 때문입니다.
+
+그다음 같은 `x_t`를 두 네트워크에 넣습니다.
+
+```text
+x_t -> teacher   -> s_real
+x_t -> μ_fake    -> s_fake
+```
+
+같은 위치에서 두 방향을 비교해야 하므로, teacher와 critic 모두 같은 `x_t`를 봅니다.
+
+### 6.3 그림의 핵심 한 줄
+
+Figure 2는 아래 문장을 그림으로 표현한 것입니다.
+
+> **DMD는 student 출력에 다시 noise를 섞은 뒤, 그 위치에서 teacher score와 fake score를 비교해 student generator를 업데이트한다.**
+
+텍스트로 줄이면:
+
+```text
+z
+ -> G_θ
+ -> x̂₀
+ -> add noise
+ -> x_t
+ -> teacher gives s_real
+ -> μ_fake gives s_fake
+ -> score difference updates G_θ
+
+추가로:
+x̂₀와 paired teacher target 사이의 L_reg도 G_θ를 안정화한다.
+```
+
+---
+
+## 7. 핵심 수식 1: 목표는 KL 줄이기
+
+DMD의 목표는 student 분포를 real/teacher 분포에 맞추는 것입니다.
+
+```math
+\min_\theta
+D_{\mathrm{KL}}
+\left(
+p_{\mathrm{fake},\theta}
+\Vert
+p_{\mathrm{real}}
+\right)
+```
+
+기호를 풀면:
+
+| 기호 | 뜻 |
 |---|---|
-| **왼쪽 (생성 + regression loss = 회귀 손실 영역)** | `random latent z` (랜덤 입력 노이즈) → **one-step generator G_θ (한 번에 바로 매핑하는 생성기)** → `fake image` (가짜 이미지). 이 fake image 와 **paired dataset (입력-정답 쌍 데이터, teacher 의 ODE 로 미리 만든 (z, x₀) 쌍)** 의 정답 사이의 MSE (평균 제곱 오차) = **regression loss L_reg** (학습 안정화용 안전망) |
-| **오른쪽 (Distribution Matching Gradient Computation = 분포 매칭 그래디언트 계산 영역)** | fake image 에 **diffusion (확산 = 노이즈 다시 씌우기)** 적용 → `noisy image` (노이즈 섞인 이미지) → **두 개의 score 네트워크 (분포의 방향을 알려주는 두 망)** 가 병렬로 호출됨 |
-| **위쪽 path (real data score function, 자물쇠 = frozen 가중치 동결)** | `real score` 출력 — teacher 가 표현하는 진짜 분포의 방향 (= 진짜 산의 경사) |
-| **아래쪽 path (fake data score function = 가짜 분포 스코어 망)** | `fake score` 출력 — μ_fake critic (스코어 추정기) 이 추정하는 student 분포의 방향. 같은 noisy image 로 **diffusion loss (denoising loss = 노이즈 제거 손실)** 도 같이 받아 같이 학습 |
-| **두 score 의 차이 (붉은 ⊖)** | `computed gradient` = `real − fake`. 이게 곧 **KL gradient 의 surrogate (대리 식)**. **빨간 화살표 `∇_θ D_KL`** 로 G_θ 에 **역전파 (back-propagation = 출력에서 입력 쪽으로 그래디언트 흘리기)** |
+| `p_fake,θ` | 현재 student가 만드는 이미지 분포 |
+| `p_real` | real/teacher 이미지 분포 |
+| `D_KL(p_fake || p_real)` | 두 분포가 얼마나 다른지 재는 값 |
 
-**핵심 포인트** (그림에서 직접 읽힘):
-1. **두 개의 score 네트워크 분리** — frozen teacher (학습 안 함, real score) + 학습되는 critic (μ_fake, fake score). 같은 noisy image 입력을 받음 (= "같은 위치에서 두 방향 비교").
-2. **fake image 가 다시 노이즈에 섞임** — score 가 **노이즈 레벨별로만 정의 (특정 t 값에서만 의미 있음)** 되니까 clean (깨끗한) 이미지 그대로는 호출 불가. (자세히는 § 6 Q7)
-3. **두 loss 가 따로 들어감** — 왼쪽 L_reg (paired regression = 정답 쌍 회귀) + 오른쪽 D_KL gradient (분포 매칭). 둘 다 G_θ 의 학습에 사용.
-4. **fake score critic 도 diffusion loss 로 동시에 학습** — student 가 분포를 바꿀 때마다 μ_fake 도 따라가야 함 (안 따라가면 fake score 가 stale = 오래된 값이 됨).
+직관:
 
-**텍스트 흐름도 (등가)**:
-
-```
-                  z (가우시안 노이즈)
-                       │
-                       ▼
-              ┌─────────────────┐
-              │   G_θ (student) │  ← 학습 대상
-              └────────┬────────┘
-                       │ x̂₀  (1-step 직사상)
-                       ▼
-              forward-diffuse  x̂₀ → x_t  (랜덤 t 로 노이즈 다시 입힘)
-                       │
-        ┌──────────────┴───────────────┐
-        ▼                              ▼
-  s_real(x_t, t)              s_fake(x_t, t)
-  = Teacher (frozen, CFG)     = μ_fake (별도 critic, 같이 학습)
-        │                              │
-        └────────────┬─────────────────┘
-                     ▼
-         grad = s_fake − s_real        ← DMD gradient
-                     │
-                     ▼
-         L_DM = 0.5 · ‖x̂₀ − (x̂₀ − grad).detach()‖²
-                     +
-         L_reg = ‖G_θ(z) − x₀_paired‖²   (teacher ODE 로 만든 paired data)
-                     │
-                     ▼
-                  ∇_θ L
-                  업데이트
+```text
+student가 만드는 이미지들의 전체 패턴이
+real/teacher 이미지들의 전체 패턴과 같아지게 하자.
 ```
 
-### 3.2 수식 (단계별)
+하지만 이 KL 값을 직접 계산하기는 어렵습니다.
 
-**목표** — student 분포를 teacher 분포에 맞추기. *(즉: 학습 파라미터 θ 를 조정해서 student 가 만드는 분포 p_fake 가 teacher 의 진짜 분포 p_real 에 가장 가까워지도록 만든다. KL 발산이 두 분포 거리 측도.)*
-```
-min_θ   D_KL( p_fake_θ  ‖  p_real )
+왜냐하면 이미지 하나 `x`에 대해:
+
+```math
+D_{\mathrm{KL}}(p_{\mathrm{fake}}\Vert p_{\mathrm{real}})
+=
+\mathbb{E}_{x\sim p_{\mathrm{fake}}}
+\left[
+\log p_{\mathrm{fake}}(x)
+-
+\log p_{\mathrm{real}}(x)
+\right]
 ```
 
-**Gradient 근사** (KL 직접 미분 대신 score 차분으로). *(즉: KL 자체는 못 미분해도, 그 미분값이 두 score 의 차이 형태로 표현 가능. 좌변은 못 구해도 우변은 score 네트워크 두 개로 계산 가능 → 학습 가능):*
-```
-∂/∂θ  D_KL( p_fake ‖ p_real )
-   ≈  E_{ t, x_t }[  ( s_fake(x_t, t)  −  s_real(x_t, t) )  ·  ∂x_t/∂θ  ]
-```
-(즉, 두 분포의 score 차이가 generator 의 그래디언트가 됨)
+이 식에는 `log p_fake(x)`와 `log p_real(x)`가 필요합니다.
 
-**Autograd surrogate (자동 미분 호환 대리 함수)** — *(즉: 위 수식을 그대로 코딩하려면 `∂x_t/∂θ` 같은 부분에서 이중 미분 = 미분을 두 번 흘리는 비싼 연산 이 필요. 그래서 "MSE 모양인데 미분하면 위와 동일한 grad 가 나오는" 대리 손실을 만들어 이중 미분 없이 안전하게 흘림.)*
+그런데 diffusion model은 보통 어떤 이미지의 절대 log probability를 직접 주지 않습니다. 대신 score, 즉 `∇ log p(x)` 방향을 줍니다.
+
+```text
+우리가 모르는 것:
+  산의 절대 높이 log p(x)
+
+우리가 얻을 수 있는 것:
+  산의 경사 방향 ∇ log p(x)
 ```
-grad   =  s_fake − s_real
-L_DMD  =  0.5 · ‖  x̂₀  −  ( x̂₀  −  grad ).detach()  ‖²
+
+DMD는 그래서 KL 값 자체가 아니라 **KL을 줄이는 방향**을 score 차이로 구합니다.
+
+---
+
+## 8. 핵심 수식 2: KL gradient는 score 차이로 근사된다
+
+DMD의 핵심 gradient는 다음 형태입니다.
+
+```math
+\nabla_\theta
+D_{\mathrm{KL}}
+\left(
+p_{\mathrm{fake},\theta}
+\Vert
+p_{\mathrm{real}}
+\right)
+\approx
+\mathbb{E}_{t,z}
+\left[
+\left(
+s_{\mathrm{fake}}(x_t,t)
+-
+s_{\mathrm{real}}(x_t,t)
+\right)
+\frac{\partial x_t}{\partial \theta}
+\right]
 ```
-*(즉: 두 번째 항 `(x̂₀ − grad)` 를 `.detach()` 로 그래디언트 차단 → autograd 입장에선 그저 상수. 그러면 이 L 을 x̂₀ 로 미분하면 `2 · 0.5 · (x̂₀ − (x̂₀ − grad)) = grad` 가 자연스럽게 떨어짐.)*
 
-→ `∂L_DMD / ∂x̂₀ = grad` 로 자연스럽게 떨어짐.
+여기서:
 
-### 3.3 DMD vs 단순 MSE distillation (= CFG distillation)
+| 기호 | 뜻 |
+|---|---|
+| `z` | student 입력 noise |
+| `x̂₀ = G_θ(z)` | student가 만든 clean image |
+| `x_t = F(x̂₀,t)` | `x̂₀`에 timestep `t`만큼 noise를 다시 섞은 것 |
+| `s_real(x_t,t)` | teacher가 알려주는 real 분포 score |
+| `s_fake(x_t,t)` | `μ_fake`가 알려주는 fake 분포 score |
 
-| 항목 — 비교 관점 | DMD (Yin 2024) | CFG distillation (Meng 2023) |
+이 식을 말로 풀면:
+
+```text
+student가 만든 이미지 위치에서
+fake 분포가 끌어당기는 방향과
+real 분포가 끌어당기는 방향을 비교한다.
+
+그 차이만큼 student를 업데이트한다.
+```
+
+왜 `s_fake - s_real`일까요?
+
+```text
+s_fake:
+  student가 이미 많이 가는 방향
+  -> 거기서 빠져나와야 함
+
+s_real:
+  real 이미지들이 많은 방향
+  -> 그쪽으로 가야 함
+```
+
+그래서 결과적으로는:
+
+```text
+student가 자기 분포의 과한 모드에서는 빠지고,
+real 분포의 모드 쪽으로 이동한다.
+```
+
+---
+
+## 9. 핵심 수식 3: autograd surrogate loss
+
+문제는 위 gradient를 그대로 구현하기 어렵다는 점입니다.
+
+그래서 DMD는 surrogate loss를 씁니다.
+
+먼저 score 차이로 gradient 방향을 계산합니다.
+
+```math
+g
+=
+s_{\mathrm{fake}}(x_t,t)
+-
+s_{\mathrm{real}}(x_t,t)
+```
+
+그다음 아래 loss를 만듭니다.
+
+```math
+\mathcal{L}_{\mathrm{DMD}}
+=
+\frac{1}{2}
+\left\|
+\hat{x}_0
+-
+\left(
+\hat{x}_0
+-
+g
+\right)_{\mathrm{detach}}
+\right\|_2^2
+```
+
+이 식이 처음 보면 이상합니다.
+
+왜 `x̂₀ - g`를 만들고 detach할까요?
+
+PyTorch autograd 관점에서 보면:
+
+```text
+(x̂₀ - g).detach()
+```
+
+는 상수입니다. 그러면 위 MSE를 `x̂₀`로 미분하면:
+
+```math
+\frac{\partial \mathcal{L}_{\mathrm{DMD}}}{\partial \hat{x}_0}
+=
+g
+```
+
+즉, 복잡한 KL gradient를 직접 미분하지 않고도, 우리가 원하는 방향 `g`가 student 출력에 gradient로 걸립니다.
+
+직관:
+
+```text
+원하는 gradient 방향 g를 먼저 계산해 둔다.
+그 방향이 autograd로 흘러가도록 MSE 모양의 가짜 loss를 만든다.
+```
+
+그래서 surrogate loss입니다.
+
+---
+
+## 10. 핵심 수식 4: `μ_fake`는 어떻게 학습되나
+
+`μ_fake`는 student가 만든 이미지 분포의 score를 추정해야 합니다.
+
+그러려면 student 출력 `x̂₀ = G_θ(z)`를 데이터처럼 사용해 diffusion denoising loss를 학습합니다.
+
+```math
+\mathcal{L}_{\mathrm{fake}}
+=
+\mathbb{E}_{z,t,\epsilon}
+\left[
+\left\|
+\epsilon
+-
+\epsilon_{\mu_{\mathrm{fake}}}
+\left(
+F(G_\theta(z),t),t
+\right)
+\right\|_2^2
+\right]
+```
+
+기호:
+
+| 기호 | 뜻 |
+|---|---|
+| `ε` | 실제로 섞은 Gaussian noise |
+| `F(G_θ(z),t)` | student 출력에 noise를 섞은 noisy image |
+| `ε_μ_fake(·)` | `μ_fake`가 예측한 noise |
+
+이건 표준 diffusion training loss와 같습니다.
+
+다만 차이가 있습니다.
+
+```text
+일반 diffusion:
+  real image에 noise를 섞고 denoising 학습
+
+DMD의 μ_fake:
+  student가 만든 fake image에 noise를 섞고 denoising 학습
+```
+
+그래서 `μ_fake`는 현재 student 분포의 score를 따라가게 됩니다.
+
+주의할 점:
+
+```text
+student가 학습되면 p_fake_θ가 바뀐다.
+그러면 μ_fake도 계속 다시 학습되어야 한다.
+```
+
+DMD2에서 TTUR가 나온 이유도 이 지점입니다. DMD에서는 `L_reg`가 이 불안정성을 어느 정도 잡아주는 안전벨트였습니다.
+
+---
+
+## 11. 핵심 수식 5: `L_reg`는 안전벨트다
+
+DMD 원논문은 순수 score difference만 쓰지 않고 regression loss를 같이 씁니다.
+
+```math
+\mathcal{L}_{\mathrm{reg}}
+=
+\mathbb{E}_{(z,y)\sim\mathcal{D}}
+\left[
+\ell(G_\theta(z),y)
+\right]
+```
+
+기호:
+
+| 기호 | 뜻 |
+|---|---|
+| `𝒟` | 미리 만든 paired dataset |
+| `z` | teacher sampling을 시작한 noise |
+| `y` | 같은 `z`에서 teacher를 여러 step 돌려 만든 target image |
+| `ℓ` | MSE 또는 LPIPS 같은 regression distance |
+
+쉽게 말하면:
+
+```text
+같은 z에서 teacher가 만든 이미지 y와
+student가 한 번에 만든 G_θ(z)를
+픽셀/feature 기준으로도 비슷하게 맞춘다.
+```
+
+이 손실은 DMD에서 매우 중요합니다.
+
+역할:
+
+```text
+distribution matching gradient:
+  분포를 맞추는 큰 방향
+
+L_reg:
+  같은 z에 대해 teacher target 근처에 묶어두는 안정화 장치
+```
+
+단점도 있습니다.
+
+```text
+paired target y를 미리 만들어야 하므로 비싸다.
+student가 teacher 출력을 베끼는 방향으로 묶인다.
+teacher를 넘기 어렵다.
+```
+
+이 단점을 해결하려고 DMD2가 `L_reg`를 제거하고 TTUR, GAN loss 등을 도입합니다.
+
+---
+
+## 12. 최종 학습 objective
+
+DMD의 generator는 두 손실을 같이 받습니다.
+
+```math
+\mathcal{L}_{G}
+=
+\mathcal{L}_{\mathrm{DMD}}
++
+\lambda_{\mathrm{reg}}
+\mathcal{L}_{\mathrm{reg}}
+```
+
+그리고 `μ_fake`는 별도로 fake denoising loss를 받습니다.
+
+```math
+\mathcal{L}_{\mu_{\mathrm{fake}}}
+=
+\mathcal{L}_{\mathrm{fake}}
+```
+
+학습 루프를 단순화하면:
+
+```text
+1. z를 뽑는다.
+2. student G_θ가 x̂₀를 만든다.
+3. x̂₀에 noise를 섞어 x_t를 만든다.
+4. teacher가 s_real을 준다.
+5. μ_fake가 s_fake를 준다.
+6. s_fake - s_real로 L_DMD surrogate를 만든다.
+7. paired target y와 비교해 L_reg를 만든다.
+8. L_DMD + λ_reg L_reg로 G_θ를 업데이트한다.
+9. student 출력에 대한 denoising loss로 μ_fake를 업데이트한다.
+```
+
+의사코드:
+
+```python
+for step in training:
+    z = sample_noise()
+
+    # student output
+    x0_hat = G_theta(z)
+
+    # distribution matching
+    t = sample_timestep()
+    x_t = add_noise(x0_hat, t)
+    s_real = teacher_score(x_t, t)      # frozen
+    s_fake = fake_score_mu(x_t, t)      # learned critic
+    g = s_fake - s_real
+    loss_dmd = surrogate_mse(x0_hat, g)
+
+    # regression safety belt
+    y = paired_teacher_target(z)
+    loss_reg = distance(x0_hat, y)
+
+    update(G_theta, loss_dmd + lambda_reg * loss_reg)
+
+    # train fake score critic
+    x0_fake = stop_gradient(x0_hat)
+    loss_fake = denoising_loss(mu_fake, x0_fake)
+    update(mu_fake, loss_fake)
+```
+
+---
+
+## 13. DMD vs CFG distillation
+
+DMD와 CFG distillation은 둘 다 distillation이지만 줄이는 비용이 다릅니다.
+
+| 항목 | DMD | CFG distillation |
 |---|---|---|
-| **최소화 대상 (학습이 줄이려는 양)** | `D_KL(p_fake ‖ p_real)` — **분포 사이 거리** | `‖v_student − v_teacher_cfg‖²` — **per-sample (샘플별) 출력 차이** |
-| **Loss 형태 (손실 함수 모양)** | score 차분 surrogate (대리 함수) | 단순 MSE (평균 제곱 오차) |
-| **μ_fake critic (가짜 분포 스코어 추정기)** | **있음** (별도 학습) | **없음** |
-| **Student 구조 (학생 모델 형태)** | `z → x₀` 1-step (한 번에 직접 매핑) | teacher 와 동일 (multi-step 유지 = 단계는 그대로) |
-| **줄이는 축 (가속의 방향)** | Step 수 (50 → 1) | CFG forward (한 step 당 2번 통과 → 1번), step 수는 그대로 |
+| 목표 | many-step diffusion을 1-step generator로 압축 | CFG의 2-forward 비용을 1-forward로 압축 |
+| student 형태 | `z -> x̂₀` one-step generator | teacher와 비슷한 denoising model |
+| 줄이는 것 | step 수 | step당 forward 수 |
+| 핵심 loss | score difference + `L_reg` | teacher CFG output과 MSE |
+| `μ_fake` critic | 있음 | 없음 |
 
-→ "DMD" 라는 단어를 정확히 쓸 때는 **반드시 μ_fake (스코어 추정기) 와 score-difference gradient (두 스코어 뺄셈 기반 그래디언트)** 가 있어야 함. 둘이 빠지면 그냥 일반 MSE distillation (평균 제곱 오차 증류).
+즉:
+
+```text
+CFG distillation:
+  한 step 안에서 cond/uncond 두 번 하던 것을 한 번으로 줄임.
+
+DMD:
+  여러 denoising step 자체를 한 번으로 줄임.
+```
+
+DMD라는 이름을 쓰려면 최소한 아래 요소가 있어야 합니다.
+
+```text
+1. student 분포 p_fake_θ
+2. fake score critic μ_fake
+3. teacher score s_real
+4. score difference로 만든 distribution matching gradient
+```
 
 ---
 
-## 4️⃣ 관련 연구 (Related Work)
+## 14. 실험 결과 요약
 
-### 4.1 CFG distillation (Meng et al. CVPR 2023, arXiv:2210.03142)
+### 14.1 주요 결과
 
-- **목표**: CFG 의 2-forward (한 step 에 cond/uncond 두 번 통과) 비용 제거. Step 수는 그대로.
-- **Loss (손실)**: *(즉: student 가 입력에 `w` 라는 guidance 강도 까지 받아서, teacher 가 cond 와 uncond 두 번 호출해서 만든 CFG-블렌딩된 결과를 한 번에 흉내내도록 MSE 로 학습)*
-  ```
-  L = E [‖ v_θ(x_t, t, c, w) − (v_uncond + w·(v_cond − v_uncond)).detach() ‖²]
-  ```
-- **Student (학생 모델)**: teacher 와 동일 구조, 보통 **LoRA (저차원 어댑터 = 추가 학습용 가벼운 모듈)** 로 가벼움.
-- **결과**: cond (조건부) 한 번 통과만으로 CFG 품질 유지 → 추론 2× 가속.
+| 데이터셋 | 모델 | NFE | FID 낮을수록 좋음 | 비고 |
+|---|---|---:|---:|---|
+| ImageNet 64x64 | EDM teacher | 79 | 1.79 | teacher |
+| ImageNet 64x64 | DMD | 1 | 2.62 | 1-step |
+| COCO-30k / LAION text-to-image | SDv1.5 teacher | 100 | 8.59 | 50 step + CFG |
+| COCO-30k / LAION text-to-image | DMD | 1 | 11.49 | 1-step |
 
-### 4.2 VSD — Variational Score Distillation (Wang et al. NeurIPS 2023)
+의미:
 
-ProlificDreamer (3D 생성 모델 논문) 에서 제안된 **3D 생성용 score distillation (스코어 증류)**. "두 분포의 score 차이" 라는 핵심 아이디어가 DMD 의 모태. DMD 는 이를 **2D image generation (2D 이미지 생성)** 으로 가져오고 **paired regression (정답 쌍 회귀 손실)** 으로 안정화한 형태.
-
-### 4.3 Flow Matching (Lipman et al. ICLR 2023)
-
-FLUX · SD3 (대표 image generation 모델들) 가 사용하는 학습 프레임. **RF (Rectified Flow, 직선화된 flow)** 가 특수 경우.
-
-*(즉, 아래 수식은 노이즈와 깨끗한 이미지를 σ 비율로 섞은 점이 x_t 가 되고, 그 점에서 학습 대상으로 삼는 "이 점에서 가야 할 방향" (velocity, 속도) 은 `ε − x₀` 라는 단순한 형태로 정의된다는 뜻):*
-```
-forward noising (노이즈 씌우는 식) :  x_t  =  (1 − σ) · x₀  +  σ · ε
-velocity target (속도 목표값)        :  v    =  ε  −  x₀
+```text
+DMD는 teacher보다 조금 품질이 낮지만,
+NFE를 극단적으로 줄인다.
 ```
 
-DMD 의 `s_real` 은 **ε-prediction (노이즈 예측 형태)** 또는 **v-prediction (속도 예측 형태)** 으로부터 자동 유도 가능.
+### 14.2 Ablation
 
----
+논문에서 중요한 ablation은 다음 흐름입니다.
 
-## 5️⃣ 실험 요약 (DMD 원논문)
-
-| 데이터셋 (학습/평가 셋) | NFE — 모델 호출 횟수 | DMD FID — 낮을수록 좋음 | Teacher FID — 비교 기준 | CLIP — 텍스트 일치도 (높을수록 좋음) | 비고 (작업 종류) |
-|---|---|---|---|---|---|
-| CIFAR-10 (32×32 작은 이미지 셋) | 1 | 3.77 | 1.97 (EDM) | — | unconditional (조건 없음, 그냥 이미지 분포만 학습) |
-| ImageNet 64×64 (저해상도 분류 셋) | 1 | **2.62** | 1.79 (EDM) | — | class-cond (클래스 레이블 조건부) |
-| LAION COCO-30k (대규모 text-image 쌍 평가) | 1 | **11.49** | 8.59 (SDv1.5) | 0.320 | text-to-image (텍스트→이미지) |
-| Speed (A100 GPU 한 장 기준) | 1 | **0.09 s/img** (한 장당 0.09 초) | 2.59 s/img (SDv1.5, 50 step) | — | ~29× 가속 |
-
-### Ablation 핵심 (구성요소 제거 실험 — Table 2, LAION)
-
-| 설정 — 어느 구성요소를 뺐는지 | FID — 낮을수록 좋음 |
+| 설정 | 결과 해석 |
 |---|---|
-| Full DMD (전체 그대로) | 11.49 |
-| − L_reg (regression loss 제거 = 정답 쌍 회귀 손실 제거) | **>19** (폭락) |
-| − μ_fake 학습 (fake score 고정 = critic 을 학습 안 시키고 고정) | 발산 (학습이 망함) |
-| − DM gradient (L_reg 만, 분포 매칭 항 제거) | 14.93 |
+| Full DMD | 가장 안정적 |
+| `L_reg` 제거 | 품질 크게 하락 |
+| `μ_fake` 학습 제거 | 학습 불안정 또는 발산 |
+| distribution matching 제거 | 단순 regression이 되어 품질 하락 |
 
-→ L_reg (정답 쌍 회귀 손실) 와 μ_fake (가짜 분포 스코어 추정기) **둘 다 critical (필수 불가결)**. 후속 DMD2 가 L_reg 를 빼면서도 안정화한 게 큰 진전.
+즉 DMD에서는:
+
+```text
+distribution matching gradient + μ_fake + L_reg
+```
+
+세 요소가 같이 필요합니다.
 
 ---
 
-## 6️⃣ Q&A
+## 15. DMD의 한계와 DMD2로 이어지는 이유
 
-### Q1. CFG distillation 과 DMD 는 단순화/일반화 관계인가?
+DMD는 1-step distillation의 가능성을 보여줬지만 한계도 명확합니다.
 
-아니오. **다른 태스크 (작업)**. CFG distillation 은 "CFG 효과를 **1-pass (한 번 통과)** 에 흡수" (step 수 유지), DMD 는 "step 수 자체를 1 로 축약" (CFG 는 별개 문제). 두 축 (축소 방향) 이 독립적이라 조합 가능.
+### 15.1 `L_reg`가 비싸다
 
-### Q2. μ_fake 는 어떻게 구현하나?
+`L_reg`를 쓰려면 paired dataset이 필요합니다.
 
-원논문은 teacher 와 같은 구조의 별도 네트워크 (full clone). 실용적으로는 **VSD 스타일 LoRA (저차원 어댑터 형태)** — teacher 본체에 **별도 LoRA adapter (추가 학습용 작은 모듈) 하나 더 붙여서** μ_fake 역할로 사용하면 메모리 부담 최소.
+```text
+(noise z, teacher가 여러 step으로 만든 target image y)
+```
 
-### Q3. "DMD" 라고 부르려면 반드시 있어야 하는 것?
+큰 text-to-image 모델에서는 이 target을 대량으로 만드는 비용이 큽니다.
 
-(1) **μ_fake critic** (가짜 분포 스코어 추정기, 학습 중 같이 업데이트), (2) **score-difference gradient `(s_fake − s_real)`** (두 스코어의 뺄셈 기반 그래디언트), (3) **KL surrogate loss** (KL 발산의 대리 손실 함수). 셋 중 하나라도 빠지면 그냥 일반 MSE distillation (평균 제곱 오차 증류) 이지 DMD 아님.
+### 15.2 teacher를 넘기 어렵다
 
-### Q4. 논문은 1-step 인데 왜 실제 시장 (FLUX-schnell, SDXL-Lightning, Z-Image-Turbo 같은 공개 가속 모델) 은 4-step / 8-step 인가?
+`L_reg`는 student를 teacher output에 묶습니다.
 
-1-step 도 존재하지만 (SDXL-Turbo 1-step, Hyper-SD 1-step) **사용자 채택의 sweet spot (가장 인기 있는 균형점) 은 4~8 step**. DMD 의 한계가 시장 채택을 막는 형태로 드러난 결과. 이유 6가지:
+안정적이지만:
 
-| 이유 — 항목 | 내용 |
+```text
+student가 teacher를 그대로 베끼는 방향으로 학습됨
+```
+
+그래서 teacher의 결함이나 한계도 같이 따라갈 수 있습니다.
+
+### 15.3 pure distribution matching은 불안정하다
+
+`L_reg`를 제거하면 `μ_fake`가 현재 student 분포를 잘 따라가야 합니다.
+
+하지만 student가 계속 바뀌므로 critic이 뒤처질 수 있습니다.
+
+```text
+student 분포는 이미 이동했는데
+μ_fake는 예전 student 분포의 score를 알려줌
+```
+
+이것이 DMD2 문서에서 말한 stale critic 문제입니다.
+
+DMD2는 이 문제를 해결하기 위해:
+
+```text
+TTUR:
+  critic을 generator보다 더 자주 학습
+
+Real-data GAN loss:
+  teacher score만 보지 않고 진짜 이미지도 직접 봄
+
+Backward simulation:
+  multi-step student의 train/inference mismatch 해결
+```
+
+을 도입합니다.
+
+---
+
+## 16. 자주 헷갈리는 질문
+
+### Q1. DMD는 그냥 teacher output MSE distillation인가?
+
+아닙니다.
+
+DMD에는 `L_reg`가 있지만, 핵심은 distribution matching gradient입니다.
+
+```text
+단순 MSE distillation:
+  teacher target과 student output을 직접 맞춤
+
+DMD:
+  teacher score와 fake score의 차이로 student 분포를 맞춤
+  + 안정화를 위해 L_reg도 사용
+```
+
+### Q2. 왜 student 출력에 다시 noise를 씌우나?
+
+Score network는 noisy input `x_t`에서 정의됩니다.
+
+Student output `x̂₀`는 clean image에 가깝기 때문에 그대로 넣으면 score network가 기대하는 입력이 아닙니다.
+
+그래서:
+
+```text
+x̂₀ -> add noise -> x_t -> score networks
+```
+
+를 거칩니다.
+
+또한 KL의 평균이 `x ~ p_fake` 위에서 잡히므로, student가 만든 위치에서 score를 비교해야 합니다.
+
+### Q3. 왜 teacher와 `μ_fake` 둘 다 같은 `x_t`를 보나?
+
+같은 위치에서 두 분포의 방향을 비교해야 하기 때문입니다.
+
+```text
+teacher:
+  이 위치에서 real 분포는 어느 방향인가?
+
+μ_fake:
+  이 위치에서 student 분포는 어느 방향인가?
+```
+
+다른 위치에서 비교하면 두 score의 차이가 의미를 잃습니다.
+
+### Q4. `μ_fake`는 discriminator인가?
+
+기본적으로 아닙니다.
+
+`μ_fake`는 real/fake 확률을 출력하는 GAN discriminator가 아니라, student 분포의 score를 추정하는 diffusion-style score estimator입니다.
+
+DMD2에서는 여기에 GAN head가 추가되지만, DMD 원논문의 `μ_fake`는 score critic입니다.
+
+### Q5. 왜 시장의 빠른 모델들은 1-step보다 4-step, 8-step이 많나?
+
+1-step은 가장 빠르지만 가장 어렵습니다.
+
+특히 고해상도 text-to-image에서는:
+
+```text
+pure noise -> 완성 이미지
+```
+
+를 한 번에 해야 해서 품질, 다양성, prompt alignment가 모두 어려워집니다.
+
+그래서 후속 연구와 실제 배포 모델들은 4-step 또는 8-step 같은 few-step distilled generator로 많이 이동했습니다.
+
+---
+
+## 17. 최종 정리
+
+DMD를 이해할 때 가장 중요한 문장은 이것입니다.
+
+> **DMD는 student가 만든 분포 `p_fake_θ`와 teacher/real 분포 `p_real`의 차이를 KL로 보고, 그 KL gradient를 `s_fake - s_real`이라는 score 차이로 근사해 1-step generator `G_θ`를 학습하는 방법이다.**
+
+구성요소별로 기억하면:
+
+| 구성요소 | 역할 |
 |---|---|
-| **CFG 호환성 (안내 기법과 같이 쓸 수 있나)** | 1-step 은 CFG 적용 불가 → **guidance 강도 (텍스트 따름 정도)** 조절 못함. 4-step + CFG = 8 forward (= teacher 의 1/12 수준). 사용자 체감 속도 차이 작은데 품질 차이 큼 |
-| **ODE trajectory 곡률 (적분 경로가 얼마나 휘었나)** | noise → image 경로가 곡선. 1-step = 직선 한 방 (오차 큼), 4-step = **piecewise linear (조각별 직선 = 4 조각의 직선으로 곡선 근사)** |
-| **Diversity (다양성) / mode collapse (모드 붕괴 = 비슷한 그림만 반복)** | 1-step **deterministic 사상 (입력 노이즈가 같으면 항상 같은 이미지가 나오는 결정론적 매핑)** → 다양성 손실. 다단계는 매 step 마다 **stochasticity 주입 (랜덤성 추가)** 여지 |
-| **고해상도 gap (high-resolution 에서 갭이 더 벌어지는 현상)** | ImageNet 64² gap (FID 갭) +0.83 / LAION gap **+2.90**. 1024² (고해상도) 면 더 벌어짐 → multi-step 이 안전 |
-| **Fine-tunability (추가 학습 가능성)** | 1-step 은 **schedule 가정 (학습 시 가정한 노이즈 일정표)** 이 너무 달라 LoRA 추가 학습 거의 불가 ([[paper-z-image]] Z-Image-Turbo 가 fine-tunability "N/A (불가)" 인 이유). 4-step 은 **customization (사용자별 맞춤 학습)** 여지 있음 |
-| **Training stability (학습 안정성)** | 1-step distillation 본질적 불안정 (L_reg 없으면 FID 11.49 → 19+ 폭락). 후속 연구가 multi-step 으로 옮겨간 것 자체가 1-step 한계의 방증 |
+| `G_θ` | 1-step student generator |
+| `p_fake_θ` | student가 만드는 이미지 분포 |
+| `s_real` | teacher/real 분포의 score |
+| `μ_fake`, `s_fake` | student 분포의 score를 추정하는 critic |
+| `L_DMD` | score 차이로 만든 distribution matching surrogate |
+| `L_reg` | paired teacher target에 묶어두는 안정화 손실 |
 
-→ **"1-step 은 가능하지만 잃는 게 많고, 4-step 도 충분히 빠르다"** 가 시장 합의.
-
-### Q5. 50 step → 1 step 가속의 본질적 원동력은?
-
-**Trajectory matching (경로 따라하기) → distribution matching (분포 맞추기) 으로 전환** 한 것. 한 줄로: **"Teacher 가 어떻게 가는지 (= 경로) 는 상관없고, 최종 도착지의 분포만 같으면 된다 — 그러니 student 는 한 번에 가도 OK"**.
-
-| 기존 (Progressive Distillation = 점진적 증류, 단계를 절반씩 줄여나가는 방식 등) | DMD |
-|---|---|
-| Teacher 의 50-step **중간 경로** 를 student 가 흉내 | 중간 경로 무시. **최종 분포** 만 맞춤 |
-| Student 도 N-step (단계 수를 절반씩 줄임) | Student 는 **임의 함수 OK** (1-step direct mapping = 한 번에 매핑 가능) |
-| "고속도로의 모든 구간을 똑같이 운전" | "어디로 가든 목적지에만 잘 도착" (= 턴바이턴 길안내 vs GPS 좌표만 알려주기) |
-
-→ Student G_θ(z) → x₀ 가 어떤 함수든 **분포 p_fake = p_real 이면 valid (학습 목표 달성)**. 중간 step 을 따라야 한다는 제약이 사라짐 = 1-step 가능의 수학적 근거.
-
-이를 실제로 계산 가능하게 만든 두 트릭:
-1. KL gradient (KL 발산의 미분값) 를 **score 차분** `(s_fake − s_real)` 로 근사
-2. **μ_fake critic (가짜 분포 스코어 추정기)** 이 "student 분포의 score" 를 알려줌
-
-### Q6. KL divergence `D_KL(p_fake ‖ p_real)` 은 왜 직접 미분 불가능한가?
-
-*(즉, 아래 KL 식은 "임의의 점 x 에서 두 분포가 그 점에 부여한 log 확률값 (= log density, 밀도의 로그) 의 차이를 student 분포 위에서 평균낸 것" 인데, 이걸 그대로 계산하려면 두 log 확률값을 각 점에서 둘 다 알아야 함):*
-```
-KL(p_fake ‖ p_real)  =  E_{x ~ p_fake}[  log p_fake(x)  −  log p_real(x)  ]
-```
-이걸 계산하려면 임의의 그림 x 에 대해 **두 확률값 (= density, 밀도) 을 둘 다 숫자로 뽑아야** 함. 이게 두 장벽 때문에 막힘.
-
-**비유 setup**: 화가 A (teacher) 의 스타일을 화가 B (student) 가 따라하는 상황.
-
-**장벽 1 — B (student) 가 자기 확률을 모름 (implicit generator = 확률 함수가 명시적으로 없는 생성기)**
-
-B 한테 "그림 그려봐" → 그림. ✅ 샘플 생성은 가능.
-B 한테 "이 그림이 너한테서 나올 확률은?" → ❌ 모름.
-
-이유: B 의 그림 그리는 과정은 `z (랜덤 노이즈) → 거대 NN (신경망) → 그림 x`. "이 x 가 나올 확률 `p_fake_θ(x)`" 을 구하려면 **change-of-variables 공식 (변수 변환 공식 = 입력 분포를 출력 분포로 변환할 때 쓰는 미적분 공식)** 의 **Jacobian determinant `|det(∂G_θ/∂z)|` (야코비 행렬식 = 출력이 입력에 얼마나 변하는지 측정하는 거대 행렬의 행렬식)** 이 필요한데, NN 의 Jacobian 은 거대 행렬 (예: 3M × 3M) → determinant 계산 비용 `O(n³)` (행렬 크기 세제곱에 비례) → **사실상 불가능**. (Normalizing Flow (정규화 흐름 = density 계산 가능하도록 special 구조를 강제한 생성 모델) 가 이걸 풀려고 special architecture (특수 구조) 를 강제하지만, diffusion student 는 자유로운 NN.)
-
-→ **"B 는 그림은 그리는데 자기가 왜 그렇게 그렸는지 확률로 설명 못 하는 화가"** (= implicit generative model = 암묵적 생성 모델).
-
-**장벽 2 — A (teacher, diffusion) 도 절대 확률값을 안 줌 (score-only = 스코어만 출력)**
-
-비유: 확률값 = **산의 높이**, score = **산의 경사 방향**.
-
-```
-   ▲ 확률 높음
-   │
-   ╱   ← teacher 는 "여기서 어디로 가야 더 높아지나" (경사) 만 줌
-  ╱       "지금 절대 높이가 얼마인지" 는 안 줌
-─────────► 그림 공간
-```
-
-왜? Diffusion 의 training loss (학습 손실) 자체가 **ε-prediction (노이즈 ε 직접 예측)** 또는 **score-prediction (스코어 직접 예측)** 형태. **`∇ log p` (score = log 확률의 미분) 만 학습 — `log p` 자체는 학습 안 함**. log-density 를 score 로부터 복구하려면 **path integral (경로 적분 = 임의 경로를 따라 score 를 누적 적분)** 이 필요한데 한 점당 50-step forward (모델 50번 통과) → 학습 비용 폭발.
-
-→ **"A 는 지도가 아니라 매 지점의 화살표만 줌"**.
-
-**결과**: 두 분포의 확률값 (p_fake, p_real) 이 둘 다 모르는 값 → KL 식의 `log p_fake − log p_real` 을 빼고 평균낼 방법이 없음 → **직접 계산도 미분도 불가능**.
-
-**DMD 의 우회**: "KL 자체는 못 구해도 KL 을 **줄이는 방향 (= ∇_θ KL)** 만 알면 학습 가능" 이라는 점을 이용. 그 방향이 두 score 의 차이로 깔끔하게 표현됨.
-
-*(즉, KL 의 절대값은 못 구해도 KL 의 미분값은 두 score 의 차이로 표현되고, 이건 score 네트워크 두 개로 계산 가능 → 우리는 학습에 미분값만 있으면 됨):*
-```
-∇_θ KL( p_fake ‖ p_real )  ≈  E[ ( s_fake  −  s_real )  ·  ∂x/∂θ ]
-                                  └─ B 의 화살표 ─┘  └─ A 의 화살표 ─┘
-                                  (μ_fake 가 알려줌)  (teacher 가 알려줌)
-```
-→ **절대 확률값 (= 산의 높이) 을 한 번도 계산 안 하고**, 두 화살표 (= 경사) 의 **차이** 만으로 generator 를 학습. 이게 DMD 의 핵심 트릭.
-
-### Q7. 학습 흐름도에서 왜 student 출력 x̂₀ 를 다시 score 네트워크 입력으로 넣고, 거기에 노이즈를 다시 씌우는가?
-
-§ 3.1 의 알고리즘 흐름이 "z → student → x̂₀ → 다시 노이즈 → score 두 개" 로 **돌고 도는 모양** 이 된 이유. 두 질문이 합쳐져 있음:
-
-**(a) 왜 student 출력을 다시 입력으로 — KL 의 기댓값 (expectation, 평균) 이 잡히는 위치 때문**
-
-*(즉, 아래 KL 식의 평균 기호 `E_{x ~ p_fake}` 가 "x 를 p_fake 분포에서 뽑아 평균낸다" 는 뜻 → 평균을 잡는 좌표 자체가 student 분포 위. 그러니 student 의 출력 점에서 평가해야 함):*
-```
-KL( p_fake ‖ p_real )  =  E_{ x ~ p_fake }[  log p_fake(x)  −  log p_real(x)  ]
-                            └─ 기댓값 잡는 분포 = p_fake ─┘
-```
-
-**기댓값 잡는 위치가 `x ~ p_fake`** — 즉 **student 가 실제로 만들어내는 점들** 에서 평가해야 함. z (노이즈 공간) 만 보고 평가하면 노이즈 공간 비교가 되고, 우리가 원하는 건 **이미지 공간 (생성된 그림이 사는 공간) 에서 분포가 같아지는 것** 이므로 student 출력 위치에서 평가 필수.
-
-→ **Student 의 출력 x̂₀ = "평가가 일어나는 좌표"**. 그 좌표에서 teacher 의 화살표(s_real) 와 student 분포의 화살표(s_fake) 를 둘 다 뽑아 차이를 잰다.
-
-**(b) 왜 노이즈를 다시 씌우는가 — Score 는 "노이즈 레벨별로만" 정의됨**
-
-Score 네트워크 (teacher, μ_fake) 는 **깨끗한 이미지 x₀ 에서는 호출 불가**.
-
-- Teacher diffusion 은 학습 시 **"노이즈 섞인 이미지 x_t (timestep t 의 중간 상태)"** 만 입력으로 봤음.
-- `s_real(x_t, t)` 는 **노이즈 레벨 t 에 따라 정의된 함수 (각 노이즈 강도별로 다른 함수값을 줌)**. t=0 (clean = 노이즈 0, 깨끗한 이미지) 에서는 학습 안 됨 → 호출 시 **분포 밖 (out-of-distribution = 학습 때 본 적 없는 입력 영역)** → 의미 없는 값.
-
-그래서 student 의 깨끗한 출력 x̂₀ 를 그대로 못 쓰고, **랜덤 t 골라 노이즈를 다시 씌워** x_t 로 만든 다음 호출.
-
-*(즉, 아래는 student 가 만든 깨끗한 이미지 x̂₀ 와 새 가우시안 노이즈 ε 를 σ_t 비율로 섞어 다시 "노이즈 레벨 t 의 중간 상태" 로 만드는 식. 이렇게 해야 score 네트워크가 정의된 입력 영역으로 들어감):*
-```
-x̂₀  (student 출력, clean = 노이즈 0)
-    │
-    │  ε ~ N(0,I), t ~ U(0,1) 추가   ← 새 가우시안 노이즈와 랜덤 timestep
-    ▼
-x_t = (1 − σ_t) · x̂₀  +  σ_t · ε    ← 이 시점에서야 score 호출 가능
-    │
-    ├──► s_real(x_t, t)   ← teacher (frozen = 가중치 고정)
-    └──► s_fake(x_t, t)   ← μ_fake (별도 critic = 스코어 추정기)
-```
-
-추가 이점: **모든 노이즈 레벨에서 분포 매칭 검사** — **coarse structure (high t = 큰 노이즈 = 이미지의 큰 구조)** 부터 **fine detail (low t = 작은 노이즈 = 세부 디테일)** 까지 전 구간 커버. 한 t 에만 매칭시키면 다른 영역에서 어긋남.
-
-**비유로 정리**
-
-학생이 100 장의 그림을 그림 (x̂₀). 선생 (teacher) 과 학생 자신 (μ_fake) 에게 묻고 싶음: **"이 100 장이 너희 각자 분포에서 어디쯤인가?"** 그런데 두 사람 모두 **"흐릿하게 보는 안경"** (= 노이즈 거쳐 학습됨 → 노이즈 섞인 입력에만 익숙함) 을 쓰고 있어서, **깨끗한 그림은 안 보임**. → 인위적으로 안개를 씌워 (= forward-diffuse, 다시 노이즈 입히기) 보여줘야 작동. 두 사람이 각각 그려준 화살표 (= score) 의 **차이** 가 곧 generator gradient (생성기 업데이트 방향).
-
-**한 줄 요약**: (a) KL 의 기댓값이 `x ~ p_fake` 위에서 잡혀서 (= 평균을 잡는 좌표가 student 출력 위) / (b) score 네트워크가 노이즈 레벨별로만 정의돼서 (= clean 입력에선 작동 안 함). 둘이 합쳐져 "student 출력 → 다시 노이즈 → score 두 개" 의 순환 구조가 만들어짐.
+DMD는 DMD2의 출발점입니다. DMD2를 이해하려면 DMD에서 **왜 `μ_fake`가 필요한지**, **왜 `L_reg`가 안정화에는 좋지만 비용과 품질 상한을 만드는지**를 먼저 이해하는 것이 중요합니다.
 
 ---
 
-## 🔚 한 줄 요약 (전체)
+## 18. 관련 메모
 
-**DMD (Yin 2024) 는 "student (학생) 의 가짜 분포 (p_fake) 와 teacher (선생) 의 진짜 분포 (p_real) 의 score (= 분포의 경사 방향) 차이를 generator (생성기) 로 역전파 (back-propagation = 그래디언트 흘리기)" 하는 분포 매칭 증류 (distribution matching distillation) 로 1-step (한 번에 바로) 이미지 생성을 실용화한 논문 — 핵심은 μ_fake critic (가짜 분포 스코어 추정기) 으로 student 분포의 score 를 추정하고, (s_fake − s_real) 차분을 KL gradient (KL 발산의 미분값) 의 surrogate (대리 함수) 로 사용해 generator 함수 형태에 제약 없이 학습 가능하게 만든 것.**
-
----
-
-## 🔗 관련 메모리 링크
-
-- [[paper-z-image]] — Z-Image 의 Decoupled DMD + DMDR (DMD 의 응용 사례)
-- [[paper-mv-split-dit]] — 1000-layer DiT 학습 안정화 (distillation 과 별개 축)
+- DMD2 후속 리뷰: [PAPER_DMD2.md](PAPER_DMD2.md)
+- DMD 논문: https://arxiv.org/abs/2311.18828
+- DMD 프로젝트 페이지: https://tianweiy.github.io/dmd/
