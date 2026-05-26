@@ -1,401 +1,958 @@
-# Any2AnyTryon: Leveraging Adaptive Position Embeddings for Versatile Virtual Clothing Tasks
+# PAPER: Any2AnyTryon 쉽게 읽기
 
-> FLUX.1-dev 의 RoPE(회전 위치 임베딩) 3채널을 의미 채널로 재해석하여, mask·pose·parsing 같은 보조 입력 없이도 가상 피팅(try-on) / 옷 추출(garment reconstruction) / 옷 입은 사람 합성(model-free try-on) 세 가지를 하나의 LoRA 모델로 처리하는 통합 프레임워크.
+## 0. 이 문서를 읽는 법
 
-## 메타 정보
+이 문서는 Any2AnyTryon 논문과 공개 코드를 보고, 처음 읽는 사람이 흐름을 놓치지 않도록 다시 정리한 리뷰입니다.
+
+핵심 목표는 하나입니다.
+
+> **Any2AnyTryon은 사람 사진, 옷 사진, 텍스트 지시문을 한 FLUX LoRA 모델에 넣어서 try-on, 옷 추출, 옷 입은 사람 생성 같은 여러 가상 피팅 작업을 처리하려는 방법이다.**
+
+처음 읽을 때는 아래 순서로 보면 좋습니다.
+
+1. 이 논문이 해결하려는 문제
+2. 등장인물: `target`, `cond_spa`, `cond_sub`, `prompt`
+3. Figure 2로 보는 전체 구조
+4. 핵심 아이디어: Adaptive Position Embedding
+5. 왜 Clean Latent가 중요한지
+6. 코드에서는 실제로 어디서 일어나는지
+7. 실험 결과와 한계
+8. 자주 헷갈리는 질문
+
+이 문서에서는 GitHub Markdown에서 깨지기 쉬운 LaTeX 수식 대신 일반 텍스트 표기를 씁니다.
+
+```text
+LaTeX 대신:
+  x_t = (1 - sigma) * x_0 + sigma * noise
+  loss = mean(weight * (pred - target)^2)
+  pos_id = [role_id, y, x]
+```
+
+---
+
+## 1. 메타 정보
 
 | 항목 | 내용 |
 |---|---|
-| 제목 | Any2AnyTryon: Leveraging Adaptive Position Embeddings for Versatile Virtual Clothing Tasks |
+| 논문 | Any2AnyTryon: Leveraging Adaptive Position Embeddings for Versatile Virtual Clothing Tasks |
 | 저자 | Hailong Guo, Bohan Zeng, Yiren Song, Wentao Zhang, Chuang Zhang, Jiaming Liu |
-| 공개일 | 2025-01 (ICCV 2025 채택) |
-| arXiv | [2501.15891](https://arxiv.org/abs/2501.15891) · [ar5iv](https://ar5iv.labs.arxiv.org/html/2501.15891) |
-| 코드 | [logn-2024/Any2anyTryon](https://github.com/logn-2024/Any2anyTryon) |
-| 프로젝트 | [logn-2024.github.io/Any2anyTryon](https://logn-2024.github.io/Any2anyTryon/) |
-| 체크포인트 | [loooooong/Any2anyTryon](https://huggingface.co/loooooong/Any2anyTryon) (LoRA 4종) |
-| 데이터셋 | [LAION-Garment](https://huggingface.co/datasets/loooooong/LAION-Garment) |
-| 분야 | Virtual Try-On (VTON), Reference-driven Image Generation, DiT |
-| 베이스 모델 | FLUX.1-dev (12B parameter, Flow Matching DiT) |
-| 외부 도구 사용 | AutoMasker (CatVTON 전처리), FLUX-Controlnet-Inpainting, GPT-4o (데이터 큐레이션), Florence2 (캡션 생성) |
+| arXiv | https://arxiv.org/abs/2501.15891 |
+| arXiv 버전 | v1: 2025-01-27, v2: 2025-03-26 |
+| 코드 | https://github.com/logn-2024/Any2anyTryon |
+| 프로젝트 | https://logn-2024.github.io/Any2anyTryon/ |
+| 체크포인트 | https://huggingface.co/loooooong/Any2anyTryon |
+| 데이터셋 | https://huggingface.co/datasets/loooooong/LAION-Garment |
+| 베이스 모델 | FLUX.1-dev |
+| 학습 방식 | FLUX는 frozen, attention LoRA만 학습 |
+| 핵심 키워드 | VTON, mask-free try-on, Adaptive Position Embedding, RoPE, clean latent |
 
 ---
 
-## 주요 용어 사전 (Glossary)
+## 2. 한 문장 요약
 
-> *왜?* 분야가 좁고 약어가 많아, 본문에 들어가기 전에 핵심 용어를 한 곳에 모아두면 따라가기 쉽다.
+> **Any2AnyTryon은 FLUX의 이미지 토큰 위치 좌표 `pos_id = [role_id, y, x]`에서 첫 번째 채널 `role_id`를 "이 토큰이 어떤 역할인지" 알려주는 표식으로 재활용해서, 사람 조건과 옷 조건을 한 시퀀스 안에서 구분하는 방법이다.**
 
-### 가상 피팅 태스크 분류
-- **VTON (Virtual Try-On)**: 가상 피팅. 사람 사진 + 옷 사진 → 그 옷을 입은 사람 사진을 생성.
-- **Garment Reconstruction (옷 추출)**: 옷 입은 사람 사진 → 옷만 분리해 평면 이미지로 복원. "TryOff" 라고도 함.
-- **Model-free Try-On**: 옷 사진만 주고, 그 옷을 입을 사람을 모델이 알아서 합성.
-- **Paired vs Unpaired**: VITON-HD 평가 설정. paired 는 정답 사진이 있는 경우 (LPIPS/SSIM 계산 가능), unpaired 는 다른 옷-사람 조합으로 정답이 없는 경우 (FID/KID 만 가능).
+조금 더 쉽게 말하면:
 
-### 위치 임베딩 / 모델 구조
-- **RoPE (Rotary Position Embedding)**: 위치를 회전 변환으로 인코딩해 어텐션에 상대 위치 정보를 주는 기법. FLUX 는 토큰마다 (channel0, y, x) 3차원 좌표를 받는다.
-- **MM-DiT (Multi-Modal DiT)**: 텍스트와 이미지 토큰을 한 시퀀스에서 함께 어텐션 처리하는 FLUX·SD3 의 transformer 블록.
-- **Adaptive Position Embedding**: 본 논문의 핵심. RoPE 의 channel0 을 "이 토큰이 타겟인지 / 공간 조건인지 / 객체 조건인지" 알려주는 역할 마커로 재활용한다.
-- **condspa (condition_spatial)**: 공간 정렬 조건. 타겟과 같은 x 좌표를 공유해 "이 자리에 있던 것" 정보를 준다. 예: 옷을 갈아입힐 사람 사진.
-- **condsub (condition_subject)**: 참조 객체 조건. 타겟 오른쪽으로 x 가 이어지는 별개 패널. 예: 입힐 옷의 평면 사진.
-- **Clean Latent**: 조건 영역에 노이즈를 안 더하고 VAE 인코딩 그대로 시퀀스에 끼우는 전략. IC-LoRA 와의 차이점.
+> **FLUX에게 이미지를 그냥 옆으로 붙여서 보여주는 것이 아니라, "이쪽은 만들 대상, 이쪽은 사람 참고 이미지, 이쪽은 옷 참고 이미지"라는 이름표를 위치 임베딩에 붙여준다.**
 
-### 비교 기법 (선행 연구)
-- **CatVTON**: 마스크 기반 SD inpainting 으로 옷을 합성. 픽셀 정확도 SOTA.
-- **IDM-VTON / OOTDiffusion**: 마스크 + 포즈/파싱 + ReferenceNet 으로 옷 특징을 주입.
-- **StableGarment / Magic Clothing**: 옷만 주고 사람을 합성 (model-free).
-- **TryOffDiff**: 옷 추출 (TryOff) 전용 베이스라인.
-- **IC-LoRA (In-Context LoRA)**: 조건을 노이즈로 흐려서 학습. 본 논문이 비판하는 접근.
+이 이름표 덕분에 모델은 별도 mask, pose, parsing 없이도 다음을 구분할 수 있습니다.
 
-### 평가 지표
-- **SSIM / MS-SSIM / CW-SSIM**: 구조적 유사도. 높을수록 좋음.
-- **LPIPS**: 학습된 특징 공간에서의 지각 거리. 낮을수록 좋음.
-- **FID / CLIP-FID**: 생성 분포와 실제 분포의 거리. 낮을수록 좋음.
-- **KID**: FID 의 unbiased 추정치. 본 논문에서는 × 1000 배 한 값으로 표기.
-- **DISTS**: 구조+텍스처 결합 지각 거리. 낮을수록 좋음.
-- **MP-LPIPS**: Model-Pose LPIPS. 자세 일관성 평가.
-- **FFA**: Fashion Faithfulness Assessment. 옷 충실도.
-
-### 학습 관련
-- **Flow Matching**: x_t = (1-σ)·x_0 + σ·noise 직선 경로 위에서 velocity 를 학습하는 방식. FLUX 의 기본 학습 목표.
-- **LoRA (Low-Rank Adaptation)**: 가중치 행렬에 저랭크 보정 행렬을 더해 일부만 학습. 본 논문은 attention 모듈에만 적용.
+```text
+target   = 새로 만들어야 하는 결과 영역
+cond_spa = 사람의 자세와 위치를 알려주는 공간 조건
+cond_sub = 옷의 모양과 질감을 알려주는 객체 조건
+```
 
 ---
 
-## 논문 요약 (TL;DR)
+## 3. 이 논문이 해결하려는 문제
 
-**한 줄**: FLUX 의 RoPE 3채널 중 잉여 채널을 "토큰의 역할 마커"로 쓰는 단 한 줄짜리 트릭으로, mask 없이 통합 VTON 모델을 만들었다.
+기존 가상 피팅(Virtual Try-On, VTON)은 보통 입력이 많습니다.
 
-**핵심 문제**:
-- 기존 VTON 은 try-on / 옷 추출 / 사람 합성이 각각 별도 모델로 학습돼야 했음
-- 거의 모든 방법이 mask, pose, parsing 같은 보조 입력에 의존
-- "사람-옷" 페어 데이터가 부족해 일반화가 약함
+```text
+사람 사진
++ 옷 사진
++ 옷 영역 mask
++ pose
++ human parsing
++ dense pose
+-> 옷을 입은 사람 이미지
+```
 
-**해결책 (3가지를 한 번에)**:
-1. **Adaptive Position Embedding**: RoPE 의 channel0 을 0(타겟) / 1(공간 조건) / 2(객체 조건)으로 사용. condspa 는 타겟과 x 좌표를 공유해 픽셀 정렬, condsub 는 타겟 오른쪽으로 x 가 이어지는 별도 패널로 배치 → 모델이 어텐션에서 자연스럽게 역할을 구분
-2. **Clean Latent 조건**: 조건 영역은 노이즈 없이 깨끗한 VAE latent 로 시퀀스에 concat. background 누설을 막음
-3. **LAION-Garment**: AutoMasker + FLUX-Inpaint + GPT-4o 필터로 6만+ 트리플 합성 데이터셋 구축
+이 방식은 성능은 좋지만 사용하기 번거롭습니다. 또한 작업마다 모델이 나뉘는 경우가 많습니다.
 
-**검증**:
-- 옷 추출 (Table 2): SSIM 0.805, LPIPS 0.328, FID 13.367 으로 TryOffDiff 대비 SOTA
-- Model-free (Table 3): CLIP-I 0.789 등 전부 1위
-- 표준 try-on (Table 4, VITON-HD): unpaired FID/KID 1위(8.965/0.981), paired LPIPS/SSIM 은 CatVTON 에 약간 밀림 (unified 트레이드오프)
+```text
+try-on 모델              : 사람 + 옷 -> 옷 입은 사람
+garment reconstruction   : 옷 입은 사람 -> 옷만 추출
+model-free try-on        : 옷 -> 그 옷을 입은 사람 생성
+multi-garment extraction : 사람 -> 여러 옷 추출
+```
+
+Any2AnyTryon의 목표는 이것입니다.
+
+```text
+하나의 FLUX LoRA
++ 다른 입력 조합
++ 다른 prompt
+-> 여러 가상 피팅 태스크 처리
+```
+
+중요한 점은 "모든 태스크를 완벽하게 SOTA로 이긴다"가 아닙니다. 논문의 핵심은 **한 모델이 여러 입력 형태를 이해하도록 만드는 좌표 설계**입니다.
 
 ---
 
-## 핵심 기여 (Contributions)
+## 4. 등장인물 정리
 
-1. **위치 임베딩의 의미 채널 재해석**: FLUX 의 3채널 RoPE 에서 사용되지 않던 채널을 "토큰 역할 ID" 로 사용. 새로운 모듈을 추가하지 않고 단일 시퀀스 처리로 mask 없는 통합 try-on 을 가능케 함.
+### 4.1 `target`
 
-2. **spatial vs subject 조건의 좌표 전략 분리**:
-   - condspa (공간 조건): 타겟과 같은 x 좌표 → 픽셀 정렬된 참조
-   - condsub (객체 조건): 타겟 오른쪽으로 x 가 offset → 별개 reference 객체
-   - 이 차이가 "옷이 어디 있는지"와 "어떤 옷인지"를 모델이 분리해서 학습하게 만듦.
+`target`은 모델이 새로 생성해야 하는 영역입니다.
 
-3. **Clean Latent 조건 학습**: IC-LoRA 와 달리 조건에 노이즈를 더하지 않음. Ablation 에서 이 설계가 가장 큰 영향을 미친다는 점이 정량적으로 확인됨.
+표준 try-on에서는 최종 결과 이미지가 `target`입니다.
 
-4. **하나의 LoRA, 네 가지 태스크**: try-on / garment reconstruction / model-free try-on / multi-garment 를 단일 체크포인트 + 다른 프롬프트로 처리. 태스크 특화 LoRA 도 같이 공개.
-
-5. **LAION-Garment 합성 파이프라인 공개**: AutoMasker → FLUX-Inpaint → GPT-4o 필터 → Florence2 캡션 의 자동화된 데이터 증강 워크플로우와 6만+ 트리플 데이터셋을 공개.
-
----
-
-## 주요 알고리즘 설명
-
-> *왜?* 본 논문의 모든 기여가 결국 "위치 임베딩을 어떻게 부여하는가" 하나로 수렴하므로, 그 구조를 코드와 함께 정확히 이해하는 것이 가장 중요하다.
-
-### 1. 입력 토큰 배치 (Spatial Layout)
-
-타겟·조건들을 가로로 이어붙여 한 시퀀스로 만든다.
-
-```
-픽셀 공간:
-+------------------+------------------+------------------+
-|  타겟 영역        |   condspa        |   condsub        |
-|  (마스크 = 1)     |   (모델 사진)     |   (옷 사진)       |
-|  노이즈 latent    |   clean latent   |   clean latent   |
-+------------------+------------------+------------------+
-   width = W_tgt      width = W_spa     width = W_sub
+```text
+사람 사진 + 옷 사진 -> target 영역에 "그 옷을 입은 사람"을 생성
 ```
 
-- 마스크는 타겟 영역만 1, 조건 영역은 0
-- inpainting 형식을 빌렸지만, 조건 영역은 "흐릿한 부분이 아니라 클린 latent" 라는 점이 핵심
+학습 중에는 `target`에 noise를 섞습니다.
 
-코드: [`infer.py:81-103`](https://github.com/logn-2024/Any2anyTryon/blob/main/infer.py#L81-L103)
-```python
-concat_image_list = [Image.fromarray(np.zeros((height, width, 3), dtype=np.uint8))]
-if has_model_image: concat_image_list.append(model_image)    # condspa
-if has_garment_image: concat_image_list.append(garment_image) # condsub
-image = Image.fromarray(np.concatenate([np.array(img) for img in concat_image_list], axis=1))
-mask = np.zeros_like(np.array(image))
-mask[:, :width] = 255  # 타겟 영역만 마스킹
+```text
+x_t = (1 - sigma) * x_0 + sigma * noise
 ```
 
-### 2. Adaptive Position Embedding 공식
+여기서:
 
-각 토큰에 부여되는 RoPE 좌표를 `[w, y, x]` 3차원으로 본다.
-
-| 영역 | w (역할 ID) | y | x |
-|---|---|---|---|
-| 타겟 | 0 | 0 ~ H | 0 ~ W_tgt |
-| condspa | 1 | 0 ~ H | **0 ~ W_spa** (타겟과 동일) |
-| condsub | 2 | 0 ~ H | **W_tgt ~ W_tgt + W_sub** (타겟 옆으로 이어붙음) |
-
-수식으로 표현하면, 조건 종류에 따른 x 좌표 결정은:
-$$
-x'_k = \begin{cases} x_k & \text{if pixel-aligned (condspa)} \\ x_k + W_{tgt} & \text{otherwise (condsub)} \end{cases}
-$$
-
-그리고 RoPE 회전 변환은 표준식:
-$$
-R_{\Theta,p}^d(q) = q \odot \cos(p\theta) + \text{rot}(q) \odot \sin(p\theta)
-$$
-
-최종 위치 임베딩은 세 채널의 회전을 concat:
-$$
-E_{pos}(q) = \text{concat}[R(w);\; R(y);\; R(x)]
-$$
-
-코드: [`src/utils.py:92-118`](https://github.com/logn-2024/Any2anyTryon/blob/main/src/utils.py#L92-L118)
-```python
-def prepare_latent_image_ids(height, width_tgt, height_spa, width_spa, height_sub, width_sub, device, dtype):
-    # 타겟: w=0, y=0..H, x=0..W_tgt
-    latent_image_ids = torch.zeros(height, width_tgt, 3, device=device, dtype=dtype)
-    latent_image_ids[..., 1] += torch.arange(height)[:, None]
-    latent_image_ids[..., 2] += torch.arange(width_tgt)[None, :]
-
-    cond_mark = 0
-    if width_spa > 0:  # condspa: w=1, x 는 타겟과 동일 좌표 공간
-        cond_mark += 1
-        condspa_image_ids = torch.zeros(height_spa, width_spa, 3)
-        condspa_image_ids[..., 0] = cond_mark
-        condspa_image_ids[..., 1] += torch.arange(height_spa)[:, None]
-        condspa_image_ids[..., 2] += torch.arange(width_spa)[None, :]  # 0 부터 시작
-
-    if width_sub > 0:  # condsub: w=2, x 는 타겟 오른쪽으로 offset
-        cond_mark += 1
-        condsub_image_ids = torch.zeros(height_sub, width_sub, 3)
-        condsub_image_ids[..., 0] = cond_mark
-        condsub_image_ids[..., 1] += torch.arange(height_sub)[:, None]
-        condsub_image_ids[..., 2] += torch.arange(width_sub)[None, :] + width_tgt  # ★ offset
-
-    return torch.cat([latent_image_ids, condspa_image_ids, condsub_image_ids], dim=-2)
-```
-
-**왜 이게 작동하나**: 어텐션은 query·key 의 위치 RoPE 회전 후 내적을 계산한다. condspa 토큰은 타겟의 같은 (y, x) 위치 토큰과 RoPE 위상이 거의 같으므로(채널0만 다름) "같은 자리"라는 신호가 강하게 전달된다. condsub 는 타겟 오른쪽으로 자연스럽게 이어진 별개 패널처럼 인식돼 "참조 객체"로 처리된다.
-
-### 3. Clean Latent 조건 (학습/추론 공통)
-
-조건 영역은 노이즈를 절대 더하지 않는다. 추론 루프에서도 매 step 강제한다.
-
-코드 (학습, [`train_lora_any2any.py:975-995`](https://github.com/logn-2024/Any2anyTryon/blob/main/train_lora_any2any.py#L975-L995)):
-```python
-noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise  # 타겟만 노이즈 부여
-packed_noisy_model_input = flux_pack_latents(noisy_model_input, ...)
-target_length = packed_noisy_model_input.shape[1]
-
-if has_cond_spa:
-    packed_condspa_model_input = flux_pack_latents(condspa_input, ...)  # ★ 노이즈 없음
-    packed_noisy_model_input = torch.concat([packed_noisy_model_input, packed_condspa_model_input], dim=-2)
-
-if has_cond_sub:
-    packed_condsub_model_input = flux_pack_latents(condsub_input, ...)  # ★ 노이즈 없음
-    packed_noisy_model_input = torch.concat([packed_noisy_model_input, packed_condsub_model_input], dim=-2)
-```
-
-코드 (추론, [`src/pipeline_tryon.py:371-373`](https://github.com/logn-2024/Any2anyTryon/blob/main/src/pipeline_tryon.py#L371-L373)):
-```python
-init_latents_proper = image_latents
-init_mask = mask
-latents = (1 - init_mask) * init_latents_proper + init_mask * latents
-# 매 step 마다 조건 영역은 GT clean latent 로 덮어쓴다
-```
-
-**Ablation 에서 이 설계가 가장 영향력 큼** — 7장 참조.
-
-### 4. 학습 손실 함수
-
-표준 Flow Matching loss 인데, **타겟 토큰에만 적용**한다.
-
-$$
-\mathcal{L} = \mathbb{E} \left[\, w(\sigma) \cdot \| v_\theta(z_t)[:T] - (\text{noise} - x_0) \|_2^2 \,\right]
-$$
-
-여기서 `[:T]` 는 시퀀스의 앞부분(= 타겟 길이 `target_length`)만 잘라낸다는 의미. 코드:
-```python
-model_pred = model_pred[:, :target_length, :]   # ★ 타겟 토큰만
-target = noise - model_input
-loss = torch.mean((weighting * (model_pred - target) ** 2)...)
-```
-
-### 5. 학습 설정
-
-| 항목 | 값 |
+| 기호 | 뜻 |
 |---|---|
-| 베이스 모델 | FLUX.1-dev (12B, frozen) |
-| 학습 가중치 | LoRA only |
-| LoRA target modules | attn.to_q/k/v/out, attn.add_q/k/v_proj/to_add_out (FFN 제외) |
-| LoRA rank | argparse 기본값 (`--rank`, 사용자 설정) |
-| 옵티마이저 | AdamW (또는 8bit AdamW) |
-| 학습 해상도 | 384~896, 16 의 배수로 랜덤 (try-on 페어는 768 cap) |
-| 텍스트 인코더 | CLIP + T5 (T5 는 8bit 양자화) |
-| Mixed Precision | bf16 |
-| 학습 데이터 | LAION-Garment 트리플 (target / condspa / condsub) |
-| Timestep weighting | logit-normal (SD3 과 동일) |
+| `x_0` | 정답 target latent |
+| `noise` | 랜덤 노이즈 |
+| `sigma` | noise 비율 |
+| `x_t` | noise가 섞인 target latent |
 
-### 6. 추론 변형 (LoRA 4종)
+### 4.2 `cond_spa`
 
-체크포인트 이름이 곧 사용 시나리오를 의미한다.
+`cond_spa`는 spatial condition입니다.
+
+쉽게 말하면:
+
+> **"사람이 어디에 있고, 어떤 자세를 하고 있고, 몸의 비율이 어떤가"를 알려주는 이미지 조건**
+
+표준 try-on에서는 사람 사진이 `cond_spa`입니다.
+
+```text
+cond_spa = 옷을 갈아입힐 사람 사진
+```
+
+`spa`는 spatial의 줄임말로 보면 됩니다.
+
+### 4.3 `cond_sub`
+
+`cond_sub`는 subject condition입니다.
+
+쉽게 말하면:
+
+> **"어떤 옷을 참고해야 하는가"를 알려주는 객체 조건**
+
+표준 try-on에서는 평면 옷 사진이 `cond_sub`입니다.
+
+```text
+cond_sub = 입힐 옷 사진
+```
+
+`sub`는 subject의 줄임말로 보면 됩니다.
+
+### 4.4 `prompt`
+
+`prompt`는 텍스트 지시문입니다.
+
+예:
+
+```text
+<MODEL> a man <GARMENT> t-shirt with pockets <TARGET> man wearing the t-shirt
+```
+
+중요한 점:
+
+```text
+<MODEL>, <GARMENT>, <TARGET>은 이미지 슬롯 인덱스가 아니다.
+```
+
+어떤 이미지가 사람이고 어떤 이미지가 옷인지는 prompt 안의 토큰이 아니라, 코드에서 어느 필드로 들어갔는지로 결정됩니다.
+
+```text
+model_image   -> condition_spatial_image -> cond_spa
+garment_image -> condition_subject_image -> cond_sub
+```
+
+---
+
+## 5. 태스크별 입력 구조
+
+Any2AnyTryon은 입력 슬롯을 다르게 채워 여러 작업을 처리합니다.
+
+| 태스크 | `target` | `cond_spa` | `cond_sub` | 결과 |
+|---|---|---|---|---|
+| 표준 try-on | 새 결과 이미지 | 사람 사진 | 옷 사진 | 사람이 그 옷을 입은 이미지 |
+| garment reconstruction | 옷 이미지 | 없음 | 옷 입은 사람 사진 | 옷만 분리한 이미지 |
+| model-free try-on | 사람 생성 결과 | 없음 | 옷 사진 | 그 옷을 입은 새 사람 |
+| try-on in layers | 새 결과 이미지 | 이미 옷 입은 사람 | 추가할 옷 | 기존 옷 위에 한 벌 추가 |
+
+가장 먼저 이해해야 할 기본형은 표준 try-on입니다.
+
+```text
+입력:
+  cond_spa = 사람 사진
+  cond_sub = 옷 사진
+  prompt   = "이 사람이 이 옷을 입게 해라"
+
+출력:
+  target = 옷을 입은 사람 사진
+```
+
+---
+
+## 6. Figure 2로 보는 큰 그림
+
+Figure 2는 세 부분으로 보면 됩니다.
+
+### 6.1 전체 파이프라인
+
+```text
+사람 이미지
++ 옷 이미지
++ instruction
+-> Any2AnyTryon
+-> 결과 이미지
+```
+
+논문은 같은 모델이 여러 instruction을 받아 다양한 결과를 만들 수 있다고 주장합니다.
+
+여기서 instruction 1, 2, 3은 한 번의 추론에서 동시에 쓰는 세 문장이 아닙니다. 같은 모델에 다른 prompt와 다른 입력 조합을 넣으면 다른 태스크를 수행할 수 있다는 뜻입니다.
+
+### 6.2 LAION-Garment 데이터 확장
+
+논문은 paired garment-model 데이터가 부족하다는 문제를 합성 데이터로 보완합니다.
+
+```text
+원본 사람 사진
+-> AutoMasker로 옷 영역 mask 생성
+-> FLUX-Controlnet-Inpainting으로 옷 영역 다시 그림
+-> GPT-4o로 품질 필터링
+-> Florence2로 instruction 생성
+-> LAION-Garment triple 구성
+```
+
+최종적으로 60,000개 이상의 triple을 만들었다고 설명합니다.
+
+### 6.3 모델 구조
+
+모델 내부는 크게 이렇게 움직입니다.
+
+```text
+텍스트 prompt
+  -> CLIP encoder
+  -> T5 encoder
+
+target latent + cond_spa latent + cond_sub latent
+  -> 한 시퀀스로 concat
+  -> FLUX DiT block
+  -> target 부분만 잘라서 decode
+  -> 결과 이미지
+```
+
+핵심은 이미지 조건을 별도 branch로 넣는 것이 아니라, **target과 조건 이미지를 한 긴 이미지 토큰 시퀀스로 붙여서 FLUX에 넣는다**는 점입니다.
+
+---
+
+## 7. 핵심 아이디어 1: Adaptive Position Embedding
+
+### 7.1 먼저 FLUX의 이미지 위치 좌표를 이해하기
+
+FLUX는 이미지 토큰마다 위치 정보를 줍니다.
+
+이 논문에서는 그 위치 정보를 다음처럼 이해하면 됩니다.
+
+```text
+pos_id = [role_id, y, x]
+```
+
+| 채널 | 의미 |
+|---|---|
+| `role_id` | 이 토큰의 역할 |
+| `y` | 세로 위치 |
+| `x` | 가로 위치 |
+
+원래 RoPE는 위치를 알려주는 장치입니다. Any2AnyTryon은 여기서 첫 번째 채널을 단순 위치가 아니라 **역할 이름표**처럼 씁니다.
+
+### 7.2 역할 이름표
+
+Any2AnyTryon의 핵심 규칙은 이겁니다.
+
+```text
+target   -> role_id = 0
+cond_spa -> role_id = 1
+cond_sub -> role_id = 2
+```
+
+즉 모델 입장에서는 모든 이미지 토큰이 한 줄로 이어져 들어오지만, 각 토큰에는 이런 이름표가 붙습니다.
+
+```text
+[0, y, x] = target token
+[1, y, x] = spatial condition token
+[2, y, x] = subject condition token
+```
+
+이것이 논문 제목의 Adaptive Position Embedding입니다.
+
+### 7.3 `cond_spa`와 `cond_sub`의 x 좌표가 다르다
+
+여기서 가장 중요한 차이가 나옵니다.
+
+`cond_spa`는 target과 같은 x 좌표계를 씁니다.
+
+```text
+target   x = 0 ... W_tgt
+cond_spa x = 0 ... W_spa
+```
+
+왜냐하면 `cond_spa`는 사람의 자세와 위치를 알려줘야 하기 때문입니다.
+
+```text
+target의 (y, x) 위치
+cond_spa의 (y, x) 위치
+-> 같은 신체 위치로 대응되기를 기대
+```
+
+반대로 `cond_sub`는 target 오른쪽으로 밀어서 별도 패널처럼 둡니다.
+
+```text
+target   x = 0 ... W_tgt
+cond_sub x = W_tgt ... W_tgt + W_sub
+```
+
+왜냐하면 옷 사진의 평면 위치는 사람 몸의 위치와 직접 맞지 않기 때문입니다.
+
+```text
+옷 사진의 가운데에 있는 로고
+사람 몸의 가운데에 있는 로고
+-> 반드시 같은 픽셀 좌표일 필요는 없음
+```
+
+### 7.4 전체 좌표 규칙
+
+정리하면 다음 표가 핵심입니다.
+
+| 영역 | `role_id` | `y` | `x` |
+|---|---:|---|---|
+| `target` | 0 | 0 ... H | 0 ... W_tgt |
+| `cond_spa` | 1 | 0 ... H | 0 ... W_spa |
+| `cond_sub` | 2 | 0 ... H | W_tgt ... W_tgt + W_sub |
+
+일반 텍스트 수식으로 쓰면:
+
+```text
+if condition is cond_spa:
+  x_pos = x
+
+if condition is cond_sub:
+  x_pos = x + W_tgt
+```
+
+이 설계가 하는 일은 간단합니다.
+
+```text
+cond_spa는 target과 같은 자리의 정보로 읽히게 한다.
+cond_sub는 target 옆에 놓인 독립 reference로 읽히게 한다.
+```
+
+---
+
+## 8. 핵심 아이디어 2: Clean Latent
+
+Any2AnyTryon에서 두 번째로 중요한 설계는 Clean Latent입니다.
+
+학습할 때 target에는 noise를 섞습니다.
+
+```text
+target:
+  x_t = (1 - sigma) * x_0 + sigma * noise
+```
+
+하지만 조건 이미지에는 noise를 섞지 않습니다.
+
+```text
+cond_spa:
+  clean VAE latent 그대로 사용
+
+cond_sub:
+  clean VAE latent 그대로 사용
+```
+
+이게 왜 중요할까요?
+
+조건 이미지는 모델에게 힌트입니다. 힌트까지 noise로 흐리면 모델은 초반 denoising step에서 옷의 패턴과 사람의 위치를 제대로 읽기 어렵습니다.
+
+```text
+나쁜 경우:
+  target도 noisy
+  condition도 noisy
+  -> 모델이 참고해야 할 정보가 흐림
+
+Any2AnyTryon:
+  target만 noisy
+  condition은 clean
+  -> 모델이 매 step 선명한 참고 이미지를 봄
+```
+
+추론 중에도 조건 영역은 매 step clean latent로 유지됩니다.
+
+```text
+latents = condition 영역은 clean latent로 덮어쓰기
+          target 영역만 denoise
+```
+
+Ablation에서도 Clean Latent 제거가 큰 성능 하락을 만듭니다. 이 문서에서는 Any2AnyTryon의 실제 성능을 이해할 때 **Adaptive PE와 Clean Latent를 한 쌍으로 봐야 한다**고 정리하는 편이 가장 쉽습니다.
+
+---
+
+## 9. 학습 목표
+
+학습 목표는 FLUX의 flow matching 방식입니다.
+
+복잡한 수식 대신 코드 관점으로 보면 이렇습니다.
+
+```text
+1. target latent x_0를 준비한다.
+2. noise를 뽑는다.
+3. x_t = (1 - sigma) * x_0 + sigma * noise 를 만든다.
+4. cond_spa, cond_sub는 clean latent로 붙인다.
+5. 모델이 velocity를 예측한다.
+6. loss는 target 토큰에 대해서만 계산한다.
+```
+
+가장 중요한 줄:
+
+```text
+model_pred = model_pred[:, :target_length, :]
+```
+
+즉 모델 출력 전체 중에서 앞부분 `target_length`만 잘라 loss를 계산합니다.
+
+일반 텍스트로 쓰면:
+
+```text
+target_velocity = noise - x_0
+loss = mean(weight * (pred_target - target_velocity)^2)
+```
+
+조건 이미지 토큰은 모델 입력에는 들어가지만, 그 조건 이미지를 다시 복원하도록 loss를 걸지는 않습니다.
+
+```text
+조건 이미지는 정답으로 맞히는 대상이 아니라,
+target을 만들기 위한 참고 자료다.
+```
+
+---
+
+## 10. 코드에서 확인할 위치
+
+### 10.1 입력 이미지를 가로로 붙이는 부분
+
+코드:
+
+```text
+infer.py
+```
+
+핵심 흐름:
+
+```python
+concat_image_list = [blank_target]
+
+if has_model_image:
+    concat_image_list.append(model_image)      # cond_spa
+
+if has_garment_image:
+    concat_image_list.append(garment_image)    # cond_sub
+
+image = concatenate_images_horizontally(concat_image_list)
+```
+
+즉 추론 시에도 다음처럼 한 장의 긴 캔버스를 만듭니다.
+
+```text
++----------+----------+----------+
+| target   | cond_spa | cond_sub |
++----------+----------+----------+
+```
+
+### 10.2 위치 ID를 만드는 부분
+
+코드:
+
+```text
+src/utils.py
+prepare_latent_image_ids(...)
+```
+
+핵심은 아래 세 가지입니다.
+
+```python
+# target: role_id = 0
+latent_image_ids[..., 0] = 0
+latent_image_ids[..., 1] = y
+latent_image_ids[..., 2] = x
+
+# cond_spa: role_id = 1, x는 0부터 시작
+condspa_image_ids[..., 0] = 1
+condspa_image_ids[..., 2] = x
+
+# cond_sub: role_id = 2, x는 target width만큼 offset
+condsub_image_ids[..., 0] = 2
+condsub_image_ids[..., 2] = x + width_tgt
+```
+
+이 함수가 논문에서 말하는 Adaptive Position Embedding의 실제 구현입니다.
+
+### 10.3 Clean Latent를 붙이는 부분
+
+코드:
+
+```text
+train_lora_any2any.py
+```
+
+학습 중 target에는 noise를 섞고, 조건은 그대로 붙입니다.
+
+```python
+noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+
+packed_noisy_model_input = pack(target_noisy)
+packed_condspa_model_input = pack(cond_spa_clean)
+packed_condsub_model_input = pack(cond_sub_clean)
+
+packed_input = concat(target_noisy, cond_spa_clean, cond_sub_clean)
+```
+
+### 10.4 추론 중 조건 영역 유지
+
+코드:
+
+```text
+src/pipeline_tryon.py
+```
+
+핵심 흐름:
+
+```python
+latents = (1 - init_mask) * init_latents_proper + init_mask * latents
+```
+
+뜻:
+
+```text
+condition 영역 = 원래 clean latent 유지
+target 영역    = denoising으로 갱신
+```
+
+---
+
+## 11. 데이터셋: LAION-Garment
+
+### 11.1 왜 데이터셋을 새로 만들었나
+
+VTON에서 가장 큰 병목은 paired 데이터입니다.
+
+paired 데이터란:
+
+```text
+같은 사람, 같은 자세, 같은 배경에서
+옷만 바뀐 이미지 쌍
+```
+
+이런 데이터는 구하기 어렵습니다. 그래서 논문은 합성 파이프라인으로 데이터를 늘립니다.
+
+### 11.2 생성 파이프라인
+
+```text
+1. 사람 사진 수집
+2. AutoMasker로 옷 영역 추정
+3. FLUX-Controlnet-Inpainting으로 옷 영역 다시 생성
+4. GPT-4o로 품질 검사
+5. Florence2로 instruction 생성
+6. target / cond_spa / cond_sub triple 구성
+```
+
+최종 규모는 60,000개 이상입니다.
+
+### 11.3 공개 데이터의 실제 스키마
+
+Hugging Face의 `loooooong/LAION-Garment` parquet에는 주로 다음 컬럼이 있습니다.
+
+| 컬럼 | 뜻 |
+|---|---|
+| `LRVS_INDEX` | 원본 인덱스 |
+| `URL` | 원본 이미지 |
+| `INPAINT_BYTES` | 인페인팅으로 만든 이미지 bytes |
+| `PRODUCT_ID` | 상품 ID |
+| `INDEX_SRC` | 출처 인덱스 |
+| `CATEGORY` | Upper Body, Lower Body, Whole Body |
+
+중요한 주의점:
+
+```text
+공개 parquet에는 caption 또는 prompt 컬럼이 없다.
+```
+
+논문은 Florence2로 instruction을 만들었다고 설명하지만, 그 결과 prompt 텍스트까지 parquet에 들어 있지는 않습니다.
+
+따라서 직접 학습하려면 사용자가 prompt를 만들어 jsonl로 구성해야 합니다.
+
+---
+
+## 12. 실험 결과를 쉽게 읽기
+
+### 12.1 Garment Reconstruction
+
+태스크:
+
+```text
+옷 입은 사람 사진 -> 옷만 분리한 이미지
+```
+
+결과:
+
+| 지표 | TryOffDiff | Any2AnyTryon |
+|---|---:|---:|
+| SSIM, 높을수록 좋음 | 0.793 | 0.805 |
+| LPIPS, 낮을수록 좋음 | 0.334 | 0.328 |
+| FID, 낮을수록 좋음 | 20.346 | 13.367 |
+| CLIP-FID, 낮을수록 좋음 | 8.371 | 3.872 |
+| KID x1000, 낮을수록 좋음 | 6.8 | 3.5 |
+
+해석:
+
+```text
+옷 추출에서는 Any2AnyTryon이 꽤 강하다.
+특히 FID / CLIP-FID가 크게 좋아진다.
+```
+
+### 12.2 Model-Free Try-On
+
+태스크:
+
+```text
+옷 사진만 주고 -> 그 옷을 입은 사람 생성
+```
+
+결과:
+
+| 방법 | MP-LPIPS, 낮을수록 좋음 | CLIP-I, 높을수록 좋음 | DiffSim, 높을수록 좋음 | FFA, 높을수록 좋음 |
+|---|---:|---:|---:|---:|
+| Magic Clothing | 0.192 | 0.642 | 0.143 | 0.459 |
+| StableGarment | 0.149 | 0.650 | 0.153 | 0.547 |
+| Any2AnyTryon | 0.141 | 0.789 | 0.202 | 0.549 |
+
+해석:
+
+```text
+옷만 주고 사람을 생성하는 작업에서도 좋은 편이다.
+CLIP-I가 크게 높아서 옷 의미 보존이 강하다고 볼 수 있다.
+```
+
+### 12.3 표준 Try-On
+
+태스크:
+
+```text
+사람 사진 + 옷 사진 -> 사람이 그 옷을 입은 이미지
+```
+
+결과 요약:
+
+| 방법 | LPIPS, 낮을수록 좋음 | SSIM, 높을수록 좋음 | FID(U), 낮을수록 좋음 | KID(U), 낮을수록 좋음 |
+|---|---:|---:|---:|---:|
+| CatVTON | 0.0582 | 0.8653 | 9.083 | 1.130 |
+| FitDiT | 0.1059 | 0.8298 | 10.340 | 1.648 |
+| Any2AnyTryon | 0.0877 | 0.8387 | 8.965 | 0.981 |
+
+해석:
+
+```text
+paired 픽셀 정합:
+  CatVTON이 더 좋다.
+
+unpaired 자연스러움:
+  Any2AnyTryon이 더 좋다.
+```
+
+즉:
+
+```text
+정확히 GT와 같은 결과가 중요하면 CatVTON이 강하다.
+mask-free, 통합성, 자연스러운 생성 다양성이 중요하면 Any2AnyTryon의 장점이 있다.
+```
+
+### 12.4 Ablation
+
+| 설정 | LPIPS, 낮을수록 좋음 | SSIM, 높을수록 좋음 | CLIP-FID, 낮을수록 좋음 | KID, 낮을수록 좋음 |
+|---|---:|---:|---:|---:|
+| Clean latent 제거 | 0.3141 | 0.6892 | 9.648 | 6.403 |
+| Adaptive PE 제거 | 0.3080 | 0.7088 | 9.434 | 5.658 |
+| Full model | 0.2590 | 0.7373 | 9.293 | 5.407 |
+
+해석:
+
+```text
+Clean latent가 특히 중요하다.
+Adaptive PE도 성능에 기여한다.
+둘 중 하나만으로 되는 것이 아니라, 둘이 같이 작동해야 한다.
+```
+
+---
+
+## 13. LoRA 체크포인트 4종
 
 | LoRA 이름 | 용도 |
 |---|---|
-| `dev_lora_any2any_alltasks.safetensors` | 통합 (가장 일반적) |
+| `dev_lora_any2any_alltasks.safetensors` | 통합 모델 |
 | `dev_lora_any2any_tryon.safetensors` | 표준 try-on 특화 |
 | `dev_lora_garment_reconstruction.safetensors` | 옷 추출 전용 |
-| `dev_lora_any2any_multi.safetensors` | 여러 옷 동시 처리 |
+| `dev_lora_any2any_multi.safetensors` | multi-garment 추출 전용 |
 
-추론 호출 예 (`prompt` 안에 `<MODEL>`, `<GARMENT>`, `<TARGET>` 토큰으로 어떤 영역이 무엇인지 자연어로 명시):
+주의:
+
+```text
+multi-garment 추출은 "한 사람 이미지에서 여러 옷을 분리"하는 방향이다.
+여러 옷을 동시에 사람에게 입히는 multi-garment try-on과는 다르다.
+```
+
+추론 예:
+
 ```bash
-python infer.py --model_image ./asset/images/model/model1.png \
-                --garment_image ./asset/images/garment/garment1.jpg \
-                --prompt "<MODEL> a man <GARMENT> t-shirt with pockets <TARGET> man wearing the t-shirt"
+python infer.py \
+  --model_image ./asset/images/model/model1.png \
+  --garment_image ./asset/images/garment/garment1.jpg \
+  --prompt "<MODEL> a man <GARMENT> t-shirt with pockets <TARGET> man wearing the t-shirt"
 ```
 
 ---
 
-## 데이터 파이프라인: LAION-Garment
+## 14. 핵심을 코드 없이 다시 설명하기
 
-> *왜?* 데이터 부족이 VTON 의 가장 큰 병목이었는데, 본 논문은 합성 트리플로 이를 우회한다. 파이프라인 자체가 재현·확장 가치가 있다.
+표준 try-on을 예로 들면:
 
-### 소스 데이터
-- **VITON-HD**: 11,491 pairs
-- **DressCode**: 49,930 pairs (upper/dress/lower)
-- **DeepFashion2**: 988 pairs
-- **LRVS-Fashion**: 패션 이미지 추가
-- **웹 크롤링**: 고품질 페어 보충
+```text
+사람 사진 = cond_spa
+옷 사진   = cond_sub
+결과 영역 = target
+```
 
-### 5단계 합성
-1. **마스크 생성**: CatVTON 의 AutoMasker 로 사람 사진에서 상/하/드레스 영역 자동 분할
-2. **인페인팅**: FLUX-Controlnet-Inpainting 으로 마스크 영역 재생성 → `(I_원본, I_garment, I_inpaint)` 트리플
-3. **품질 필터**: GPT-4o 가 자세 일관성, 자연스러움, 정합성 검수
-4. **캡션 생성**: Florence2 가 태스크별 instruction 텍스트 자동 생성 (예: "The set of three images display a model, a garment, and the model wearing the garment.")
-5. **픽셀 정합**: `crop_to_multiple_of_16` 로 원본·합성 이미지 크기 정합
+모델에게는 세 이미지를 이렇게 보여줍니다.
 
-**최종 규모**: 60,000+ triple
+```text
++----------------+----------------+----------------+
+| target         | cond_spa       | cond_sub       |
+| noisy latent   | clean latent   | clean latent   |
+| role_id = 0    | role_id = 1    | role_id = 2    |
++----------------+----------------+----------------+
+```
 
----
+그다음 위치 좌표를 이렇게 붙입니다.
 
-## 실험 요약
+```text
+target:
+  pos_id = [0, y, x]
 
-> *왜?* 네 가지 태스크별로 측정 지표와 비교 기법이 달라, 표로 나눠 한눈에 비교한다.
+cond_spa:
+  pos_id = [1, y, x]
+  x는 target과 같은 좌표계
 
-### Table 2: Garment Reconstruction (옷 추출, VITON-HD)
+cond_sub:
+  pos_id = [2, y, x + W_tgt]
+  x는 target 오른쪽으로 offset
+```
 
-| 지표 | TryOffDiff | **Any2AnyTryon** |
-|---|---|---|
-| SSIM ↑ | 0.793 | **0.805** |
-| MS-SSIM ↑ | 0.712 | **0.710** |
-| CW-SSIM ↑ | 0.466 | **0.453** |
-| LPIPS ↓ | 0.334 | **0.328** |
-| FID ↓ | 20.346 | **13.367** |
-| CLIP-FID ↓ | 8.371 | **3.872** |
-| KID ↓ (× 1000) | 6.8 | **3.5** |
-| DISTS ↓ | 0.226 | **0.217** |
+이 설계의 직관:
 
-→ **거의 모든 지표 SOTA**. FID/CLIP-FID 는 약 2배 차이.
+```text
+cond_spa:
+  "target의 이 위치에는 이런 몸과 자세가 있어야 해"
 
-### Table 3: Model-Free Try-On (옷만 주고 사람 합성)
+cond_sub:
+  "참고할 옷은 오른쪽 패널에 따로 있어"
 
-| 방법 | MP-LPIPS ↓ | CLIP-I ↑ | DiffSim ↑ | FFA ↑ |
-|---|---|---|---|---|
-| Magic Clothing | 0.192 | 0.642 | 0.143 | 0.459 |
-| StableGarment | 0.149 | 0.650 | 0.153 | 0.547 |
-| **Any2AnyTryon** | **0.141** | **0.789** | **0.202** | **0.549** |
-
-→ 전 지표 1위. 특히 CLIP-I 0.789 로 옷 의미 보존이 크게 개선됨.
-
-### Table 4: 표준 Try-On (VITON-HD)
-
-| 방법 | LPIPS ↓ | SSIM ↑ | FID(P) ↓ | KID(P) ↓ | FID(U) ↓ | KID(U) ↓ |
-|---|---|---|---|---|---|---|
-| GP-VTON | 0.0677 | 0.8722 | 8.649 | 3.669 | 11.708 | 3.990 |
-| OOTDiffusion | 0.1317 | 0.7838 | 12.131 | 4.335 | 15.136 | 5.774 |
-| IDM-VTON | 0.0815 | 0.8156 | 8.206 | 1.727 | 10.745 | 2.229 |
-| **CatVTON** | **0.0582** | **0.8653** | **5.482** | **0.384** | 9.083 | 1.130 |
-| FitDiT | 0.1059 | 0.8298 | 8.362 | 1.543 | 10.340 | 1.648 |
-| **Any2AnyTryon** | 0.0877 | 0.8387 | 6.934 | 0.7387 | **8.965** | **0.981** |
-
-(P = paired, U = unpaired. KID 는 × 1000)
-
-→ **흥미로운 분할**: paired 픽셀 정확도(LPIPS/SSIM)는 CatVTON 이 SOTA, **unpaired 자연스러움(FID/KID)은 Any2AnyTryon 이 1위**. 통합·mask-free 의 트레이드오프로 해석 가능.
-
-### Table 5: Ablation
-
-| 설정 | LPIPS ↓ | SSIM ↑ | CLIP-FID ↓ | KID ↓ |
-|---|---|---|---|---|
-| Clean latent 제거 | 0.3141 | 0.6892 | 9.648 | 6.403 |
-| Adaptive PE 제거 | 0.3080 | 0.7088 | 9.434 | 5.658 |
-| **Full** | **0.2590** | **0.7373** | **9.293** | **5.407** |
-
-→ **Clean latent 가 더 결정적**. Adaptive PE 도 분명한 기여.
+target:
+  "이제 두 조건을 보고 결과를 만들어"
+```
 
 ---
 
-## 💬 Q&A
+## 15. 자주 헷갈리는 질문
 
-### Q1. 왜 condspa 와 condsub 를 RoPE 좌표로 분리해야 하나? 그냥 모두 오른쪽으로 이어붙이면 안 되나?
+### Q1. 왜 `cond_spa`와 `cond_sub`를 다르게 배치하나?
 
-**A**: 두 조건의 의미가 본질적으로 다르기 때문이다.
-- **condspa (모델 사진)**: "이 자리에 사람이 있다" 라는 **공간 정렬 정보**를 줘야 한다. 옷이 입혀질 위치, 사람의 포즈, 신체 비율 등이 모두 동일 좌표계에서 의미가 있다. → 타겟과 같은 (y, x) 좌표 공유.
-- **condsub (옷 평면 사진)**: 옷의 모양·텍스처·디테일이라는 **객체 정보**만 주면 되고, 옷이 평면에 펼쳐진 위치는 타겟의 신체 위치와 무관하다. → 별개 패널처럼 옆에 붙임.
+두 조건의 의미가 다르기 때문입니다.
 
-만약 둘 다 같은 좌표계를 공유하면, 어텐션이 옷의 평면 위치와 사람의 옷 위치를 혼동할 수 있다. 반대로 둘 다 offset 으로 처리하면, 모델이 "이 옷이 그 자리에 들어가야 한다" 는 공간 단서를 잃는다.
+`cond_spa`는 사람의 자세와 위치를 알려줍니다. 그래서 target과 같은 좌표계를 공유해야 합니다.
 
-### Q2. CatVTON 이 LPIPS·SSIM 에서 더 좋은데, Any2AnyTryon 의 의미는 뭔가?
+```text
+사람 사진의 팔 위치
+-> 결과 이미지의 팔 위치와 대응되어야 함
+```
 
-**A**: 세 가지 관점에서 봐야 한다.
-1. **셋업의 공정성**: CatVTON 은 mask + 마스킹된 사람 + 옷 을 입력으로 받는다. Any2AnyTryon 은 mask 없이 사람+옷만 받는다 (test_vitonhd.py 에서는 fair 비교 위해 `--repaint` 로 mask 를 추가로 쓸 수도 있다). 즉 비교 기준이 동일하지 않다.
-2. **자연스러움 vs 픽셀 충실도**: unpaired FID/KID 가 더 좋다는 것은 "옷의 다양성·자연스러움" 에서 우위라는 뜻. paired LPIPS/SSIM 이 약간 밀리는 것은 "GT 와 픽셀 단위 정합" 에서 손해.
-3. **다기능성**: CatVTON 은 try-on 전용. Any2AnyTryon 은 네 가지 태스크 + 가변 해상도 + 멀티 옷.
+`cond_sub`는 옷의 모양과 질감을 알려줍니다. 옷 사진의 픽셀 위치가 사람 몸의 픽셀 위치와 직접 대응되지는 않습니다.
 
-→ **전자상거래용 사진 그대로 보여주는 픽셀 충실도가 필요하면 CatVTON, 새로운 구성·다기능이 필요하면 Any2AnyTryon**.
+```text
+평면 옷 사진의 소매 위치
+-> 사람이 입었을 때의 소매 위치와 1:1 픽셀 대응은 아님
+```
 
-### Q3. Clean Latent 가 왜 그렇게 중요한가? (Ablation 결과의 해석)
+그래서 `cond_sub`는 target 오른쪽에 놓인 별도 reference처럼 처리합니다.
 
-**A**: 두 가지 메커니즘이 작동한다.
-1. **신호 대비**: 조건이 노이즈로 흐려져 있으면, denoising step 초기에는 조건 자체도 노이즈에 묻혀 "이게 옷의 모양인지 노이즈인지" 모델이 분간하기 어렵다. Clean latent 는 매 step 옷의 디테일을 변하지 않는 강한 신호로 유지.
-2. **Background 누설 차단**: IC-LoRA 처럼 조건도 함께 denoise 하면, 조건 영역의 background 가 미세하게 변하고 그 변화가 어텐션을 통해 타겟에도 전달돼 의도치 않은 변형을 만든다. Clean latent + 매 step 강제 덮어쓰기 (`latents = (1-mask)*init_proper + mask*latents`) 로 이를 봉쇄.
+### Q2. prompt의 `<MODEL>`, `<GARMENT>`, `<TARGET>`이 이미지 번호인가?
 
-Ablation 의 LPIPS 0.3141 → 0.2590 변화 (약 18% 감소)가 이를 정량적으로 뒷받침.
+아닙니다.
 
-### Q4. 한계점은?
+이미지 슬롯은 prompt가 아니라 입력 필드로 정해집니다.
 
-**A**:
-1. **paired LPIPS/SSIM 이 CatVTON 에 밀린다**: 픽셀 단위 정합이 결정적인 경우엔 안 맞을 수 있음.
-2. **`--repaint` 옵션이 별도**: VITON-HD 평가에서는 결국 마스크와 AutoMasker 가 다시 등장. "완전히 mask-free" 는 일반 사용 범위에 한정.
-3. **GPT-4o 의존**: 데이터 큐레이션에 closed model 사용 → 재현성 약화. LAION-Garment 자체는 공개됐지만 동일 큐레이션 재실행은 어려움.
-4. **합성 데이터 신뢰성**: FLUX-Inpaint 가 만든 "그 옷을 입은 모습" 은 합성. 손·텍스처 아티팩트가 학습에 어떻게 전이됐는지 분석은 부족.
-5. **LoRA-only**: 베이스 FLUX 의 분포 편향(예: 동양인·노인 등)을 그대로 물려받음.
-6. **multi-garment 같은 신기능에 정량 평가가 부족**: 정성 그림 위주 시연.
+```text
+--model_image   -> cond_spa
+--garment_image -> cond_sub
+```
 
-### Q5. 이 아이디어를 다른 태스크에 옮기면?
+`<MODEL>`, `<GARMENT>`, `<TARGET>`은 prompt 문장을 의미 단위로 나누기 위한 텍스트 convention에 가깝습니다.
 
-**A**: "RoPE channel0 = 토큰 역할 ID" 라는 발상은 reference-driven 생성 전반에 유용하다.
-- **Identity Preservation**: condsub = 얼굴 참조 사진
-- **Style Transfer**: condsub = 스타일 참조
-- **Layout-to-Image**: condspa = layout/sketch 가 같은 좌표 공간에
-- **Multi-subject Composition**: condsub 가 여러 개, 각각 다른 x offset
+### Q3. CatVTON보다 항상 좋은가?
 
-이미 OmniControl, IP-Adapter 등이 유사 방향을 시도하지만, Any2AnyTryon 의 **"같은 x 좌표 공유 vs offset 으로 분리"** 라는 명시적 분리가 깔끔하다.
+아닙니다.
+
+CatVTON은 mask 기반 try-on에 강합니다. paired setting에서 LPIPS와 SSIM은 CatVTON이 더 좋습니다.
+
+Any2AnyTryon의 장점은 다른 쪽입니다.
+
+```text
+1. mask 없이 쓸 수 있다.
+2. 하나의 구조로 여러 태스크를 처리한다.
+3. unpaired FID / KID가 좋다.
+4. FLUX 기반이라 reference-driven 생성 확장성이 있다.
+```
+
+### Q4. Clean Latent가 왜 그렇게 중요한가?
+
+조건 이미지는 모델이 참고해야 할 힌트입니다.
+
+조건 이미지까지 noise를 섞으면:
+
+```text
+옷 디테일이 흐려짐
+사람 자세 정보가 흐려짐
+초기 denoising step에서 reference가 약해짐
+```
+
+Clean Latent를 쓰면:
+
+```text
+옷과 사람 조건은 항상 선명함
+target만 denoise하면 됨
+```
+
+그래서 ablation에서 Clean Latent 제거의 성능 하락이 큽니다.
+
+### Q5. 여러 옷을 동시에 입히는 것도 되나?
+
+논문과 코드 기준으로는 **지원한다고 보기 어렵습니다.**
+
+근거:
+
+```text
+1. condition_subject_image는 기본적으로 한 장 슬롯이다.
+2. cond_sub 전체가 role_id = 2 하나로 묶인다.
+3. 옷별로 다른 role_id를 주는 구조가 아니다.
+4. 공개 multi 체크포인트는 multi-garment "추출"용이다.
+5. 논문 평가는 multi-item simultaneous try-on을 정량 평가하지 않는다.
+```
+
+실용적으로는 한 번에 한 벌씩 순차 적용하는 layered 방식이 더 안전합니다.
+
+```text
+1차: 사람 + 티셔츠 -> 티셔츠 입은 사람
+2차: 티셔츠 입은 사람 + 자켓 -> 티셔츠 위에 자켓 입은 사람
+```
+
+### Q6. 학습 prompt는 어떻게 만들어야 하나?
+
+공개 LAION-Garment parquet에는 prompt가 없으므로 직접 만들어야 합니다.
+
+간단한 템플릿은 다음과 같습니다.
+
+| 태스크 | `cond_spa` | `cond_sub` | prompt 예 |
+|---|---|---|---|
+| 표준 try-on | 사람 사진 | 옷 사진 | `Change her dress to a brown dress` |
+| 하의 try-on | 사람 사진 | 바지 사진 | `Change her pants to plaid trousers` |
+| garment reconstruction | 없음 | 옷 입은 사람 | `A plaid shirt` |
+| model-free try-on | 없음 | 옷 사진 | `A smiling woman wearing the garment` |
+
+jsonl 예:
+
+```json
+{
+  "target_image": "/data/inpaint_00.jpg",
+  "condition_spatial_image": "/data/src_00.jpg",
+  "condition_subject_image": "/data/garment_flat_00.jpg",
+  "prompt": [
+    "Change her dress to a brown dress",
+    "Replace the model's outfit with a brown long dress",
+    "She is now wearing a brown dress"
+  ]
+}
+```
+
+코드에서는 prompt가 리스트면 epoch마다 랜덤으로 하나를 고를 수 있습니다.
 
 ---
 
-## 한 줄 요약 (전체)
+## 16. 한계와 주의점
 
-**FLUX 의 RoPE 잉여 채널을 "토큰 역할 마커" 로 재해석하고, condspa(타겟과 같은 x 좌표) vs condsub(타겟 오른쪽으로 offset) 으로 위치를 분리하고, clean latent 로 조건 영역을 매 step 강제 덮어쓰기 함으로써, mask 없이 통합 try-on / 옷 추출 / 사람 합성 / 멀티옷을 단일 FLUX LoRA 로 수행한다.**
+1. paired LPIPS / SSIM은 CatVTON보다 약합니다.
+2. 평가에서 `--repaint`를 쓰는 경우 mask 기반 후처리 또는 보조 절차가 다시 들어갑니다.
+3. 데이터 생성에 GPT-4o 같은 closed model이 들어가 재현성이 약합니다.
+4. 공개 데이터셋에는 caption/prompt가 없습니다.
+5. 합성 데이터는 FLUX-Inpaint의 artifact를 포함할 수 있습니다.
+6. LoRA-only 학습이므로 FLUX.1-dev의 기본 분포 편향을 그대로 물려받을 수 있습니다.
+7. 여러 옷을 동시에 입히는 multi-garment try-on은 구조적으로 명확히 지원하지 않습니다.
 
 ---
 
-## 관련 메모리 링크
+## 17. 최종 정리
 
-- [[reference_pretrained_backbone_reuse_landscape]] — FLUX backbone 재사용 분기 (분기 B-DiT 카테고리)
-- [[paper_z_image]] — DiT 기반 단일 스트림 transformer 의 다른 사례
-- [[paper_lumina_next]] — DiT 위치 임베딩 (RoPE 변형) 또 다른 사례
+Any2AnyTryon을 가장 짧게 이해하면 다음입니다.
+
+```text
+문제:
+  기존 VTON은 mask, pose, parsing 같은 보조 입력이 많고 태스크별 모델이 나뉜다.
+
+해결:
+  FLUX의 이미지 토큰 위치 좌표를 [role_id, y, x]로 보고,
+  role_id를 target / spatial condition / subject condition 구분에 사용한다.
+
+핵심 설계:
+  target   = noisy latent, role_id 0
+  cond_spa = clean latent, role_id 1, target과 같은 x 좌표
+  cond_sub = clean latent, role_id 2, target 오른쪽으로 x offset
+
+학습:
+  조건 이미지는 clean latent로 유지하고,
+  loss는 target 토큰에만 건다.
+
+결과:
+  하나의 FLUX LoRA 구조로 try-on, 옷 추출, model-free try-on 등을 처리한다.
+
+주의:
+  표준 try-on의 픽셀 정합은 CatVTON이 더 강할 수 있고,
+  여러 옷 동시 입히기는 지원한다고 보기 어렵다.
+```
+
+한 줄로 줄이면:
+
+> **Any2AnyTryon은 "무엇을 만들지"와 "무엇을 참고할지"를 별도 모듈이 아니라 RoPE 위치 좌표의 역할 ID로 구분하게 만든 FLUX 기반 통합 가상 피팅 LoRA다.**
