@@ -1,700 +1,1146 @@
-# PAPER_Sana
+# PAPER: Sana - Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers 쉽게 읽기
 
-> SANA: Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers
-> NVIDIA · MIT HAN Lab · Tsinghua, 2024-10-14
+## 0. 이 문서를 읽는 법
+
+이 문서는 Sana 논문과 공개 코드를 보고, 처음 읽는 사람이 전체 구조를 놓치지 않도록 다시 정리한 리뷰입니다.
+
+핵심 목표는 하나입니다.
+
+> **Sana는 4K 같은 고해상도 이미지를 만들 때 너무 비싸지는 DiT의 비용을, 압축 오토인코더와 선형 어텐션으로 크게 줄인 text-to-image 모델이다.**
+
+DMD, DMD2 문서와 같이 읽는다면 이렇게 보면 좋습니다.
+
+```text
+DMD/DMD2 = 이미 학습된 느린 diffusion model을 빠른 student로 증류하는 방법
+Sana     = 처음부터 빠르게 돌도록 text-to-image diffusion backbone을 설계하는 방법
+```
+
+즉 Sana는 DMD처럼 "teacher를 짧은 step student로 압축"하는 논문이 아닙니다.
+
+Sana의 질문은 이것입니다.
+
+```text
+고해상도 이미지에서 DiT가 느린 이유는 무엇인가?
+그 병목을 모델 구조 자체에서 어떻게 줄일 수 있는가?
+```
+
+이 문서는 아래 순서로 읽으면 가장 편합니다.
+
+1. **큰 그림**: Sana가 해결하려는 병목
+2. **등장인물**: DC-AE, Linear DiT, Gemma text encoder, Flow-DPM-Solver
+3. **핵심 장치 5개**: 왜 각각 필요한지
+4. **Linear Attention 직관**: 왜 `O(N^2)`가 `O(N)`이 되는지
+5. **코드 연결**: 논문 아이디어가 코드에서 어디 보이는지
+6. **실험 결과와 FAQ**: 숫자와 헷갈리는 점
 
 ---
 
-## 📋 메타 정보
+## 1. 메타 정보
 
 | 항목 | 내용 |
 |---|---|
-| **논문 제목** | SANA: Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers |
-| **저자** | Enze Xie, Junsong Chen, Junyu Chen, Han Cai, Haotian Tang, Yujun Lin, Zhekai Zhang, Muyang Li, Ligeng Zhu, Yao Lu, Song Han (총 11명) |
-| **소속** | NVIDIA · MIT HAN Lab · Tsinghua University |
-| **공개일** | 2024-10-14 (v1, arXiv) — v3 2024-10-20 |
-| **분야** | Text-to-Image Generation, Diffusion Transformer, Efficient Inference |
-| **논문 링크** | [arxiv abstract](https://arxiv.org/abs/2410.10629) · [PDF](https://arxiv.org/pdf/2410.10629) · [HTML](https://arxiv.org/html/2410.10629v3) |
-| **코드** | [github.com/NVlabs/Sana](https://github.com/NVlabs/Sana) (Apache-2.0) |
-| **자매 논문 (DC-AE)** | [arxiv 2410.10733](https://arxiv.org/abs/2410.10733) — 같은 그룹 같은 날 공개, Sana는 이걸 가져다 사용 |
-| **외부 모델** | Gemma-2-2B-IT (텍스트 인코더, Google 사전학습 그대로) |
-| **외부 데이터** | VLM 캡션 (VILA-3B/13B, InternVL2-8B/26B로 합성) |
-| **백본 분류** | DiT 본체는 scratch + 텍스트 인코더만 (C) 분기 LLM 재사용 하이브리드. 가장 가까운 비교: PixArt-Σ + Gemma로 갈아끼운 효율 극단화 버전 |
+| 논문 | SANA: Efficient High-Resolution Image Synthesis with Linear Diffusion Transformers |
+| 저자 | Enze Xie, Junsong Chen, Junyu Chen, Han Cai, Haotian Tang, Yujun Lin, Zhekai Zhang, Muyang Li, Ligeng Zhu, Yao Lu, Song Han |
+| 소속 | NVIDIA, MIT HAN Lab, Tsinghua University |
+| 공개 | arXiv v1 2024-10-14, v3 2024-10-20 |
+| arXiv | https://arxiv.org/abs/2410.10629 |
+| 코드 | https://github.com/NVlabs/Sana |
+| 라이선스 | Apache-2.0 |
+| 관련 오토인코더 논문 | Deep Compression Autoencoder for Efficient High-Resolution Diffusion Models, arXiv 2410.10733 |
 
 ---
 
-## 📚 주요 용어 사전 (Glossary)
+## 2. 한 문장 요약
 
-### 아키텍처 · 압축
+> **Sana는 이미지를 32배 압축하는 DC-AE, self-attention을 선형 비용으로 바꾼 Linear DiT, Gemma-2-2B text encoder, Flow-DPM-Solver를 결합해 0.6B/1.6B급 작은 모델로 1024px와 4K 이미지를 빠르게 생성하는 시스템이다.**
 
-- **DC-AE (Deep Compression Autoencoder)** — 이미지를 잠재공간 (latent space) 으로 압축하는 오토인코더 (autoencoder). 기존 SD VAE의 8배 압축을 **32배까지 끌어올린 것**. 별도 자매 논문에서 학습한 가중치를 Sana에서 가져다 사용. (즉 Sana 안에서 새로 학습한 게 아님)
-- **F32C32P1** — Sana의 잠재 공간 표기법. F=공간 다운샘플 비율 32배, C=잠재 채널 수 32, P=DiT의 패치 크기 1. 기존 SD VAE는 F8C4P2 (8배·4채널·patch 2).
-- **잠재 공간 (latent space)** — 이미지 픽셀을 직접 다루는 대신 압축된 표현 공간에서 작업. 메모리·연산 절감의 핵심.
-- **Linear DiT** — 이미지 토큰 사이의 어텐션을 **선형 복잡도 (linear complexity, O(N))** 로 만든 Diffusion Transformer. 기존 DiT는 토큰 수² (O(N²)) 라서 4K 같은 고해상도에 치명적.
-- **LiteLA (Lightweight Linear Attention)** — Sana가 실제로 쓰는 선형 어텐션 모듈. ReLU 기반 커널 트릭으로 softmax 없이 어텐션을 계산함.
-- **커널 함수 (kernel function, φ)** — softmax처럼 모든 토큰을 동시에 묶지 않고 **각 입력에 따로 적용되는 element-wise 함수**. Sana는 가장 단순한 φ = ReLU 채택. φ를 양쪽에 따로 적용할 수 있게 만들면 행렬 곱 결합 순서를 바꿀 수 있음 (= 분배법칙 살리기).
-- **분배법칙 (distributive law)** — `(Σⱼ Aⱼ) · B = Σⱼ (Aⱼ · B)`. Linear Attention의 모든 마법이 일어나는 지점. softmax는 분모가 모든 j'에 의존해서 분배법칙을 깸 → N×N 표 강제. ReLU 같은 단순 함수로 갈아끼우면 분배법칙이 살아나 K·V를 미리 합쳐 둘 수 있음 (= O(N²) → O(N)).
-- **Mix-FFN (= GLUMBConv)** — Linear DiT의 피드포워드 (feed-forward network, FFN). 일반 MLP 대신 **3×3 깊이별 합성곱 (depthwise convolution)** 을 끼워 넣어 위치 정보와 지역성 (local pattern) 보강. **Linear attention의 표현력 손실을 보상하는 핵심 짝꿍** — Linear만 단독 교체하면 성능 떨어지지만, Mix-FFN 결합 시 표준 attention보다 우수.
-- **NoPE (No Positional Embedding)** — 별도의 위치 임베딩 (positional embedding) 을 제거. Mix-FFN 안의 zero-padding된 3×3 conv가 위치 단서를 암묵적으로 제공해줌.
+조금 더 쉽게 말하면:
 
-### 텍스트 조건
+> **이미지를 만들 때 "볼 픽셀/토큰 수" 자체를 줄이고, 남은 토큰끼리 비교하는 비용도 줄인 모델이다.**
 
-- **Decoder-only LLM Text Encoder** — T5 같은 인코더-디코더 구조 대신 **한 방향으로만 흐르는 LLM (decoder-only, GPT 계열)** 인 Gemma-2-2B-IT를 텍스트 인코더로 사용.
-- **CHI (Complex Human Instruction)** — 사용자 프롬프트 앞에 길고 정교한 시스템 지시문을 붙이는 프롬프트 엔지니어링 기법. LLM의 instruction-following 능력을 활용해 캡션을 정제·확장.
+Sana를 이해할 때 가장 중요한 식은 수학 공식이 아니라 아래 구조입니다.
 
-### 학습 · 샘플링
+```text
+Sana = DC-AE 32x 압축
+     + Linear DiT
+     + Gemma text encoder
+     + Flow-DPM-Solver
+```
 
-- **Flow Matching** — 노이즈 → 이미지 경로를 직선화한 학습 방식. SD3·FLUX·Sana 모두 채택.
-- **Flow-DPM-Solver** — Flow Matching 학습 모델에 기존 **DPM-Solver++** (속도 빠른 ODE solver) 를 적응시킨 샘플러. 28~50 step → 14~20 step으로 절반 감소.
-
-### 평가 지표
-
-- **rFID (reconstruction FID)** — 오토인코더가 이미지를 압축·복원했을 때 화질 지표. 낮을수록 좋음.
-- **GenEval** — 텍스트-이미지 정합성 (객체 수·색·위치 등) 자동 평가.
-- **DPG-Bench** — 복잡한 long prompt에 대한 정합성 평가.
-- **MJHQ-30K FID** — Midjourney 스타일 데이터셋 FID.
-- **ImageReward** — 인간 선호도를 학습한 보상 모델 점수.
+이 네 가지가 동시에 작동합니다. 하나만 떼어 보면 효과가 작거나 품질이 떨어질 수 있습니다.
 
 ---
 
-## 🎯 논문 요약 (TL;DR)
+## 3. 먼저 알아야 할 큰 그림
 
-**0.6B/1.6B의 작은 DiT로 4K 이미지를 FLUX-12B 대비 약 100배 빠르게 생성하는 텍스트-이미지 모델.**
+### 3.1 text-to-image diffusion은 보통 어떻게 이미지 만들까?
 
-핵심 아이디어 4가지:
+일반적인 latent diffusion은 픽셀 이미지를 바로 다루지 않습니다.
 
-1. **32배 압축 오토인코더 (DC-AE)** — 잠재 토큰 수를 1024² 기준 16,384 → 1,024로 16배 줄임 (메모리 절감의 1차 동력)
-2. 모든 self-attention을 **선형 어텐션 (Linear Attention, LiteLA)** 로 교체 — 토큰 수² → 토큰 수에 비례하도록 (특히 4K에서 결정타)
-3. T5-XXL (4.7B) 대신 작은 **decoder-only LLM (Gemma-2-2B)** 로 프롬프트 인코딩 — 6× 빠르고 instruction-following 능력 활용
-4. **Flow-DPM-Solver** 로 샘플링 step을 28~50 → 14~20으로 절반 단축
+```text
+image
+  -> VAE encoder
+  -> latent
+  -> diffusion model이 latent에서 denoising
+  -> VAE decoder
+  -> image
+```
 
-검증: 1024² 1.6B 모델 1.2초/장 (FLUX-dev 23초의 1/19), **4K 9.6초** (FLUX 469초의 1/49), RTX 4090 INT8 0.37초/장.
+이렇게 하는 이유는 픽셀 공간이 너무 크기 때문입니다.
+
+예를 들어 1024x1024 이미지를 그대로 다루면 픽셀이 백만 개가 넘습니다. 그래서 Stable Diffusion 계열은 보통 VAE로 이미지를 8배 줄인 latent에서 작업합니다.
+
+### 3.2 DiT에서 무엇이 비싼가?
+
+DiT는 이미지를 토큰 시퀀스로 보고 transformer를 돌립니다.
+
+문제는 self-attention입니다.
+
+```text
+토큰 N개가 있으면
+각 토큰이 다른 모든 토큰을 본다
+
+비용 ~= N x N
+```
+
+1024px에서는 어떻게든 가능해도, 4K로 가면 토큰 수가 크게 늘고 `N^2` 비용이 폭발합니다.
+
+Sana는 이 병목을 두 번 줄입니다.
+
+```text
+1단계: DC-AE로 토큰 수 N 자체를 줄인다.
+2단계: Linear Attention으로 N^2 attention을 N에 가까운 비용으로 바꾼다.
+```
+
+### 3.3 Sana가 해결하려는 문제
+
+기존 고품질 모델은 보통 아래 방향으로 갑니다.
+
+```text
+큰 모델
+많은 토큰
+full attention
+많은 sampling step
+```
+
+품질은 좋지만 비용이 큽니다.
+
+Sana는 반대로 묻습니다.
+
+```text
+작은 모델로도 고해상도를 만들려면
+어디를 줄여야 하는가?
+```
+
+Sana의 답:
+
+```text
+이미지 latent 토큰 수를 줄이고,
+self-attention을 선형화하고,
+text encoder는 더 작지만 instruction-following이 좋은 LLM을 쓰고,
+sampler step도 줄인다.
+```
 
 ---
 
-## ⭐ 핵심 기여 (Contributions)
+## 4. 등장인물 정리
 
-1. **DC-AE (32× 압축 오토인코더)** — 단순히 깊이만 늘리면 rFID 0.31→0.82로 무너지는 문제를 **잔차 연결 (residual autoencoding) + 다단계 학습** 으로 해결. rFID 0.34로 SDXL VAE (0.31) 동급 화질 유지. **자매 논문 ([arxiv 2410.10733](https://arxiv.org/abs/2410.10733))** 에서 별도 학습된 가중치를 가져옴.
+### 4.1 DC-AE
 
-2. **Linear DiT** — 표준 self-attention을 **LiteLA (ReLU 커널 기반 선형 어텐션)** 로 전부 교체. cross-attention만 표준 유지 (텍스트 토큰은 적기 때문). 추가로 **Mix-FFN (GLUMBConv)** 로 선형 어텐션의 약한 지역성 보강 + **NoPE** 로 positional embedding 제거.
+DC-AE는 **Deep Compression Autoencoder**입니다.
 
-3. **Decoder-only LLM 텍스트 인코더 (Gemma-2-2B-IT)** — 이전 시도들이 실패한 이유 (Gemma 임베딩 분산이 T5보다 수 자릿수 큼 → NaN loss) 를 **RMSNorm + learnable scale 0.01** 의 단순한 트릭으로 해결. CHI 프롬프트 엔지니어링으로 GenEval +2.0 추가 향상.
+역할:
 
-4. **Flow-DPM-Solver** — t≈T (순수 노이즈 근처) 에서 noise 예측은 불안정하지만 **data 예측은 거의 상수처럼 안정** 한 점을 이용해 DPM-Solver++의 σ_t 파라미터화를 Flow Matching에 이식. 14~20 step으로 28~50 step 수준 품질 달성.
+```text
+이미지 -> 32배 작아진 latent
+latent -> 이미지 복원
+```
 
-5. **End-to-end 효율 시스템** — 4가지 컴포넌트의 곱셈으로 1.6B 모델이 1024² 1.2초, **4K 9.6초** (FLUX-dev 469초 → 49× 가속), RTX 4090 INT8 0.37초/장.
+기존 Stable Diffusion VAE는 보통 8배 압축입니다.
+
+Sana의 DC-AE는 32배 압축입니다.
+
+```text
+1024x1024 image
+  -> DC-AE
+  -> 32x32 latent grid
+```
+
+즉 1024px 이미지를 DiT가 볼 때 공간 토큰이 1024개 정도로 줄어듭니다.
+
+중요한 점:
+
+> **DC-AE는 Sana 논문 안에서 처음부터 자세히 학습한 컴포넌트라기보다, 같은 그룹의 별도 자매 논문에서 만든 32x 압축 오토인코더를 Sana가 가져다 쓰는 구조입니다.**
+
+### 4.2 Linear DiT
+
+Linear DiT는 Sana의 diffusion transformer 본체입니다.
+
+일반 DiT와 가장 큰 차이:
+
+```text
+일반 DiT: self-attention = softmax attention, 비용 O(N^2)
+Sana DiT: self-attention = LiteLA linear attention, 비용 O(N)
+```
+
+단, 모든 attention을 단순히 갈아끼운 것은 아닙니다.
+
+```text
+이미지 토큰끼리 보는 self-attention -> Linear Attention
+텍스트를 보는 cross-attention      -> Standard Attention 유지
+```
+
+왜냐하면 텍스트와 이미지의 정밀한 매칭은 sharp attention이 중요하기 때문입니다.
+
+### 4.3 Mix-FFN
+
+Linear Attention만 넣으면 품질이 떨어질 수 있습니다.
+
+이유:
+
+```text
+softmax attention은 특정 토큰을 날카롭게 찍어 볼 수 있음
+linear attention은 더 부드러운 평균에 가까워질 수 있음
+```
+
+Sana는 이 약점을 **Mix-FFN**으로 보완합니다.
+
+Mix-FFN은 FFN 안에 3x3 depthwise convolution을 넣습니다.
+
+역할:
+
+```text
+주변 토큰의 지역 패턴을 보강한다.
+위치 정보도 어느 정도 제공한다.
+```
+
+그래서 Sana는 별도 positional embedding을 쓰지 않는 **NoPE** 구조도 가능해집니다.
+
+### 4.4 Gemma-2-2B text encoder
+
+Sana는 T5-XXL 대신 Gemma-2-2B-IT를 text encoder로 씁니다.
+
+쉽게 말하면:
+
+```text
+프롬프트를 이미지 모델이 이해할 수 있는 text feature로 바꾸는 역할
+```
+
+Sana가 Gemma를 쓴 이유:
+
+| 항목 | T5-XXL | Gemma-2-2B-IT |
+|---|---|---|
+| 크기 | 4.7B | 2.2B |
+| 속도 | 느림 | 더 빠름 |
+| instruction-following | 약함 | 강함 |
+| 역할 | 기존 T2I에서 많이 쓰임 | Sana의 decoder-only text encoder |
+
+주의할 점:
+
+> **Gemma를 그대로 붙이면 text embedding의 scale이 커서 학습이 불안정해질 수 있습니다.**
+
+Sana는 이를 `RMSNorm + 작은 learnable scale`로 안정화합니다.
+
+### 4.5 Flow-DPM-Solver
+
+Sana는 Flow Matching 기반 모델입니다.
+
+기본 Euler sampler를 쓰면 step 수가 많아질 수 있습니다. Sana는 Flow-DPM-Solver를 써서 적은 step으로도 품질을 유지하려고 합니다.
+
+역할:
+
+```text
+많은 denoising step을 줄여 inference를 빠르게 한다.
+```
 
 ---
 
-## 🛠️ 주요 알고리즘 설명
+## 5. Sana의 전체 구조
 
-<p align="center">
-  <img src="figures/sana_fig5.png" alt="SANA Overview (Fig. 5)" width="900"/>
-</p>
+논문 Figure 5를 문장으로 풀면 아래 흐름입니다.
 
-> **Fig. 5 — Overview of Sana.**
-> **(a) 전체 학습 파이프라인**: 입력 이미지 → **32× Deep Compression AutoEncoder (DC-AE)** → 32배 압축된 latent → **Linear DiT (N×Blocks)** (Linear Attn + Cross Attn + Mix-FFN으로 구성) → 노이즈 예측. 텍스트 조건은 **Small LLM (Gemma-2-2B-IT)** 이 처리하며, 사용자 prompt 앞에 **"Complex Human Instruction"**(CHI)을 붙여 한 번에 입력. **Positional Embedding은 빨간 X 표시 — 사용하지 않음 (NoPE)**.
-> **(b) Linear DiT 모듈 상세**: 왼쪽 **Linear Attention** (Linear+ReLU로 Q,K를 매핑, MatMul 두 번 — KᵀV를 먼저 계산해 O(N²)→**O(N)**), 오른쪽 **Mix-FFN** (1×1 ConvLayer + **3×3 ConvLayer (depthwise)** + 1×1 ConvLayer로 지역성과 위치 정보 보강). **softmax 없는 선형 attention의 약점을 Mix-FFN의 conv가 보완**하는 구조.
+```text
+prompt
+  -> CHI instruction을 붙임
+  -> Gemma-2-2B-IT text encoder
+  -> text feature
 
-핵심 메시지: SANA의 효율성은 단일 기법이 아니라 **3박자 조합** — (1) DC-AE로 토큰 수 자체를 1/16로 압축, (2) Linear Attention으로 잔여 토큰에 대한 attention을 O(N²)→O(N), (3) Mix-FFN으로 linear attention이 잃는 지역성 회복. 아래 ①~⑤로 각 부품을 풀어 설명합니다.
-
-### ① DC-AE (Deep Compression Autoencoder)
-
-**문제:** 기존 SD VAE는 8배 다운샘플 (F8C4). 1024² → 128×128×4 = 65,536 latent 값. DiT에서 patch=2 묶어도 4,096 토큰. **4K (4096²)** 가 되면 65,536 토큰이 되어 O(N²) attention이 폭발.
-
-**해결:** **32배 다운샘플 + 32 채널 (F32C32)**. 1024² → 32×32×32 = **1,024 토큰** (16× 감소).
-
-**구조 (코드 [diffusion/model/dc_ae/efficientvit/models/efficientvit/dc_ae.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/dc_ae/efficientvit/models/efficientvit/dc_ae.py)):**
-
-```
-Encoder: project_in (3 → 128 ch)
-       → 6 stages (width=[128, 256, 512, 512, 1024, 1024], depth=[2]×6)
-       → 각 stage마다 EfficientViT block + 2× spatial 다운샘플
-       → project_out (→ 32 ch latent)
-Decoder: 대칭 역순
-유효 다운샘플: 2^(6-1) = 32배
+image
+  -> DC-AE encoder
+  -> 32x 압축 latent
+  -> Linear DiT가 noise/velocity를 예측
+  -> DC-AE decoder
+  -> generated image
 ```
 
-**왜 32배가 가능한가:** SD VAE를 단순히 깊게 쌓으면 정보 병목 (information bottleneck) 으로 화질이 무너짐 (rFID 0.31 → 0.82). DC-AE는 **잔차 연결을 압축 단계에 추가** 하고 **저해상도 → 고해상도로 다단계 finetune** 해서 정보 손실을 막음.
+Linear DiT block 안에서는 아래 일이 반복됩니다.
 
-**rFID 비교 (논문 Table 1):**
-
-| AE | 압축 | 채널 | rFID ↓ | PSNR ↑ |
-|---|---|---|---|---|
-| SDXL VAE | 8× | 4 | 0.31 | 31.41 |
-| SD VAE F32C64 (naive 확장) | 32× | 64 | **0.82** ❌ | — |
-| **DC-AE F32C32 (Sana)** | 32× | 32 | **0.34** ✅ | 29.29 |
-
-> **주의:** DC-AE 자체의 학습 디테일은 [자매 논문 (arxiv 2410.10733)](https://arxiv.org/abs/2410.10733) 에 있음. Sana 본 논문은 인용만 함. 보통 두 논문을 짝으로 읽음.
-
-### ② Linear DiT — LiteLA (ReLU Linear Attention)
-
-**문제:** 표준 self-attention은 `softmax(QK^T)V` → 메모리·연산 모두 **O(N²)**. 1024² 이미지의 1,024 토큰만 해도 1024² ≈ 100만 칸 행렬을 만들어야 하고, 4K 이미지 16,384 토큰이면 약 2.7억 칸 (40GB GPU도 부족).
-
-#### 쉬운 설명 — 왜 softmax가 N² 표를 강제하는가
-
-먼저 분배법칙 (distributive law) 부터 떠올리기:
-
-```
-(a + b + c) · d  =  a·d + b·d + c·d        ← 초등 수학
-( Σⱼ Aⱼ ) · B    =  Σⱼ ( Aⱼ · B )           ← 같은 성질, 행렬 버전
+```text
+latent tokens
+  -> LiteLA self-attention
+  -> text cross-attention
+  -> Mix-FFN
+  -> 다음 block
 ```
 
-**Attention을 합으로 풀어쓰면** (softmax 일단 무시):
+핵심은 이 순서입니다.
 
-```
-Out_i = Σⱼ ( Q_i · K_jᵀ ) · V_j
-      = Q_i · ( Σⱼ K_jᵀ · V_j )           ← 분배법칙으로 Q_i 빼내기
-              ─────────────────
-              M = i와 무관한 d×d 행렬 ⭐
-```
-
-→ M (= Σⱼ K_jᵀ V_j) 를 **한 번만** 계산해두면 모든 i가 재사용. **N×N 표 안 만들어도 됨.** 이게 Linear의 핵심.
-
-**그런데 softmax가 끼면 왜 안 되는가:**
-
-```
-Out_i = Σⱼ  exp(Q_i · K_jᵀ)
-            ─────────────────────  · V_j
-            Σⱼ' exp(Q_i · K_j'ᵀ)        ← 분모가 모든 j'에 의존!
+```text
+DC-AE가 토큰 수를 줄임
+Linear Attention이 토큰 비교 비용을 줄임
+Mix-FFN이 Linear Attention의 약한 지역성을 보완함
+Gemma가 텍스트 이해를 담당함
+Flow-DPM-Solver가 sampling step을 줄임
 ```
 
-- 분모가 "**다른 j' 들 전부를 봐야**" 계산됨 → 한 항씩 분리 (= 분배법칙) 불가
-- 따라서 N×N 표를 **반드시 다 만들어야** softmax 정규화가 끝남 → 메모리 O(N²) 강제
+---
 
-**가게 비유:**
+## 6. 핵심 장치 1: DC-AE 32x 압축
 
-| | 표준 Attention (softmax) | Linear Attention (φ-kernel) |
+### 6.1 왜 필요한가?
+
+고해상도 diffusion에서 가장 먼저 부담되는 것은 토큰 수입니다.
+
+1024x1024 이미지를 생각해 봅니다.
+
+기존 8x VAE를 쓰면 latent 공간은 대략 아래처럼 됩니다. 실제 DiT token 수는 patch size로 한 번 더 묶느냐에 따라 달라질 수 있지만, 먼저 latent grid 크기만 보면 이렇습니다.
+
+```text
+1024 / 8 = 128
+latent grid = 128 x 128
+토큰 수 = 16,384
+```
+
+Sana의 32x DC-AE를 쓰면:
+
+```text
+1024 / 32 = 32
+latent grid = 32 x 32
+토큰 수 = 1,024
+```
+
+토큰 수가 16분의 1이 됩니다.
+
+attention 비용은 토큰 수의 제곱에 비례하므로, standard attention 기준으로는 이 감소가 훨씬 크게 작용합니다.
+
+```text
+토큰 수 16배 감소
+-> attention 행렬 크기 256배 감소
+```
+
+### 6.2 그냥 VAE를 더 세게 압축하면 안 되나?
+
+그게 어렵습니다.
+
+압축을 강하게 하면 정보가 사라져서 복원 화질이 나빠집니다.
+
+Sana가 쓰는 DC-AE는 이 문제를 줄이기 위해 별도 논문에서 다음 아이디어를 씁니다.
+
+```text
+잔차 오토인코딩
+다단계 학습
+고압축에서도 reconstruction 품질 유지
+```
+
+논문에서 중요한 비교는 아래처럼 이해하면 됩니다.
+
+| 오토인코더 | 압축 | 의미 |
 |---|---|---|
-| 비유 | "1:1 면접 후 줄세우기" | "점원이 미리 요약 카드 만들어두기" |
-| 흐름 | 손님 i가 점원 N명 모두와 만나 점수 매김 → 그 N개를 나란히 정규화 (softmax) | 점원들이 각자 (K_j, V_j) 를 ReLU로 변환해 합산 카드 M = Σⱼ φ(K_j)V_j 미리 작성 |
-| 손님당 비용 | N명 만남 | M 카드 1장 보기 |
-| 전체 비용 | **N² 만남** | **N 만남** |
-| 카드 재사용 | 불가 (매번 softmax 다시) | **모든 손님이 재사용** ⭐ |
+| SDXL VAE | 8x | 기존 강한 baseline |
+| naive 32x VAE | 32x | 단순히 압축만 키우면 품질 하락 |
+| DC-AE F32C32 | 32x | 32x 압축에서도 쓸 만한 복원 품질 |
 
-#### φ로 갈아끼우기 — 분배법칙 살리기
+### 6.3 코드에서 어디 보나?
 
-핵심 발상:
+Sana 저장소 안에서는 DC-AE 관련 구현이 아래 경로에 있습니다.
 
-```
-softmax( Q · Kᵀ )      ← 두 입력이 섞인 후 정규화 (분리 불가)
-        ↓ 대체
-φ(Q) · φ(Kᵀ)           ← 각자 따로 처리 후 단순 곱셈 (분리 가능!)
+```text
+diffusion/model/dc_ae/efficientvit/models/efficientvit/dc_ae.py
 ```
 
-φ는 **각 입력에 따로 적용되는 element-wise 함수** 여야 함 (그래야 분배법칙이 살아남). Sana는 가장 단순한 형태 채택: **φ = ReLU**.
+구조를 아주 단순화하면:
 
-```
-ReLU(x) = max(0, x)        ← 음수만 0으로, 양수 그대로
-```
+```text
+Encoder:
+  image
+  -> 여러 stage로 downsample
+  -> 32-channel latent
 
-→ 음수 유사도 (negative similarity) 라는 비상식적 상황을 자연스레 제거하면서, 행렬 만들 필요 없이 각 칸에 따로 적용 가능.
-
-**Linear Attention 변종 비교:**
-
-| 방법 | 커널 함수 φ | 특징 |
-|---|---|---|
-| Performer (FAVOR+) | 가우시안 커널 랜덤 근사 | 정확하지만 복잡 |
-| Linformer | K, V를 저차원 투영 | 시퀀스 길이 고정 |
-| Cosformer | cos 가중 | 부드러운 attention |
-| **LiteLA (Sana)** | **ReLU** | **가장 단순·빠름, Triton 융합 친화** ⭐ |
-
-#### LiteLA 핵심 수식
-
-```
-Out_i = ReLU(Q_i) · Σⱼ ReLU(Kⱼ)ᵀ · Vⱼ
-        ─────────────────────────────
-        ReLU(Q_i) · Σⱼ ReLU(Kⱼ)ᵀ · 1
+Decoder:
+  latent
+  -> 여러 stage로 upsample
+  -> image
 ```
 
-- 분자: 값 (value) 들의 가중합
-- 분모: 가중치들의 합 (softmax의 분모 역할, 정규화)
+Sana 문서에서 `F32C32` 같은 표기가 나오면 이렇게 읽으면 됩니다.
 
-**행렬 곱 순서 변경 효과 (1024² 이미지, N=1024, d=32):**
-
-| 단계 | 표준 Attention | LiteLA (Linear) | 비율 |
-|---|---|---|---|
-| 중간 행렬 (Q·Kᵀ) | 1024×1024 = 1,048,576 칸 | **만들지 않음** | – |
-| 중간 행렬 (Kᵀ·V) | – | 32×32 = 1,024 칸 | 1/1024 |
-| 메모리 | O(N²) ≈ 1M | O(d²) ≈ 1K | **~1000× 작음** |
-| FLOPs | O(N²·d) ≈ 33M | O(N·d²) ≈ 33K | **~1000× 작음** |
-
-**4K 이미지 (N=16,384) 에선 격차가 폭발:**
-
-| | 표준 Attention | LiteLA |
-|---|---|---|
-| 중간 행렬 | 16,384² ≈ **2.7억 칸** | 32² = **1,024 칸** |
-| GPU 메모리 | 40GB도 부족 (OOM) | 가뿐 |
-
-#### 실제 코드 한 줄 한 줄
-
-📍 [diffusion/model/nets/sana_blocks.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/nets/sana_blocks.py)
-
-```python
-class LiteLA(Attention_):
-    def __init__(self, ...):
-        self.kernel_func = nn.ReLU(inplace=False)   # φ = ReLU
-
-    def attn_matmul(self, q, k, v):
-        # 입력 shape: (B, h, d, N)
-        # B=batch, h=heads, d=head_dim(=32), N=토큰수(=1024)
-        
-        # Step 1. 커널 함수 적용
-        q = self.kernel_func(q)              # ReLU(Q)
-        k = self.kernel_func(k)              # ReLU(K)
-        
-        # Step 2. 정규화 분모 트릭 — V 끝에 모든 값이 1인 행 추가
-        v = F.pad(v, (0,0,0,1), value=1)     # (B, h, d+1, N)
-        # 한 번의 행렬곱으로 분자(d행)와 분모(1행)를 동시 계산
-        
-        # Step 3. ⭐ 핵심: 오른쪽부터 결합 (= K·V 먼저)
-        vk = torch.matmul(v, k)              # (B, h, d+1, d) — N과 무관한 작은 행렬!
-        out = torch.matmul(vk, q)            # (B, h, d+1, N)
-        
-        # Step 4. 마지막 행(분모)으로 나누어 정규화
-        out = out[:,:,:-1] / (out[:,:,-1:] + self.eps)
-        return out                           # (B, h, d, N)
-```
-
-**6줄짜리** 함수가 핵심. **softmax 호출이 어디에도 없음.**
-
-**Triton 커널 융합:** activation, padding, division 같은 element-wise 연산을 행렬곱과 융합해 GPU 메모리 전송 오버헤드 최소화. 코드의 `triton_linear` 옵션이 이걸 활성화.
-
-#### Cross-Attention은 왜 표준 유지?
-
-```python
-if attn_type == "linear":
-    self.attn = LiteLA(...)              # ⭐ self-attention만 Linear
-# Cross-attention은 attn_type과 별개로 항상 standard
-self.cross_attn = MultiHeadCrossAttention(...)
-```
-
-| 비교 | Self-Attn (이미지↔이미지) | Cross-Attn (이미지↔텍스트) |
-|---|---|---|
-| Key/Value 토큰 수 | N_img = 1,024 | N_text ≈ 300 (3× 작음) |
-| QKᵀ 행렬 크기 | 1024² = 1M | 1024×300 = 307K |
-| 표현력 필요성 | 낮음 (지역 패턴) | **높음** (단어 → 이미지 영역 정확 매칭) |
-| 결정 | **Linear로 교체** | **Standard 유지** |
-
-→ Cross-attention은 비용도 작고 sharp focus가 더 중요해서 표준 유지.
-
-#### ⭐ 성능 비교 — Linear vs Standard Attention
-
-**단독 비교 (학계 일반론):**
-
-| 측면 | Standard (softmax) | Linear (φ-kernel) |
-|---|---|---|
-| **표현력 (expressivity)** | 높음 — sharp focus 가능 | 낮음 — 부드러운 분포만 |
-| **장기 의존성** | 강함 | 약함 |
-| **정확한 검색 (retrieval)** | 한 토큰 정확히 집어냄 | 흐릿한 평균에 가까움 |
-| **단독 벤치마크** | 기준 | 보통 1~3% 하락 |
-
-→ LLM 분야에서 Performer·Linformer 등 Linear attention이 주류에 채택되지 않은 이유 (정확한 토큰 lookup이 핵심이라).
-
-**Sana 논문의 Ablation (Table 3, 6) — 동일 모델 구조에서 attention만 바꿔 비교:**
-
-| 설정 | FID ↓ | CLIP ↑ | GenEval ↑ | Latency |
-|---|---|---|---|---|
-| Vanilla (standard) Attention + MLP | 6.0 | 28.0 | 0.51 | 1.0× |
-| **Linear Attention + MLP** | 6.5 | 27.8 | 0.49 | **0.7×** |
-| **Linear Attention + Mix-FFN (Sana 전체)** | **5.9** | **28.4** | **0.55** | **0.7×** |
-
-핵심 발견:
-1. **Linear만 단독 교체 → 약간 떨어짐** (FID 6.0 → 6.5, GenEval 0.51 → 0.49)
-2. **Linear + Mix-FFN 결합 → 표준보다 우수** (FID 5.9, GenEval 0.55)
-3. **속도는 30% 빠름**
-
-→ **Mix-FFN이 Linear attention의 표현력 손실을 정확히 보상.** 이게 Sana 논문의 진짜 발견 — "Linear을 썼다"가 아니라 "Linear이 작동하게 만드는 시스템 설계".
-
-**다른 SOTA 표준 attention 모델과의 비교 (1024×1024):**
-
-| 모델 | Attention | 파라미터 | FID ↓ | GenEval ↑ | DPG ↑ | Latency |
-|---|---|---|---|---|---|---|
-| PixArt-Σ | Standard | 0.6B | 6.15 | 0.54 | 80.5 | 1.5s |
-| SD3-Medium | MM-DiT (full) | 2B | – | 0.62 | 84.1 | 4.4s |
-| FLUX-dev | MM-DiT (full) | 12B | 10.15 | **0.67** | 84.0 | 23.0s |
-| **Sana-0.6B** | **Linear (LiteLA)** | 0.6B | **5.81** | 0.64 | 83.6 | **0.9s** |
-| **Sana-1.6B** | **Linear (LiteLA)** | 1.6B | **5.76** | 0.66 | **84.8** | 1.2s |
-
-→ FID에서는 **모든 표준 attention 모델보다 우수**, GenEval에서는 FLUX-12B와 거의 동등 (1/20 파라미터), DPG에서는 1위. **19~26× 빠름.**
-
-**왜 이미지에서는 잘 되고 LLM에서는 안 되나:**
-
-| | LLM (텍스트) | Diffusion (이미지) |
-|---|---|---|
-| Attention 패턴 | **Sharp** — "5번째 단어를 정확히 본다" | **Soft** — "주변 픽셀을 부드럽게 본다" |
-| 장기 의존성 | 매우 중요 (앞 문장 retrieval) | 비교적 덜 중요 (인접 정보가 핵심) |
-| 정확 검색 | 필수 (이름·숫자) | 거의 불필요 |
-| 지역성 | 글로벌 (멀리 있어도 정확히) | 로컬 (인접이 핵심) |
-
-→ **이미지 attention 패턴 자체가 본래 부드러워서** Linear의 약점이 큰 문제가 안 됨. Mix-FFN의 conv가 지역성을 채워주면 표준과 동등.
-
-**4K에서 격차 폭발:**
-
-| 해상도 | Standard (FLUX-dev 12B) | Linear (Sana-1.6B) | 비율 |
-|---|---|---|---|
-| 1024² | 23초 | 1.2초 | 19× |
-| 2048² (대략) | ~92초 | 3.6초 | 25× |
-| **4096² (4K)** | **469초 (8분)** | **9.6초** | **49×** ⭐ |
-
-→ 해상도 올라갈수록 Standard는 N² 비용으로 폭발, Linear은 N으로 선형 증가. **고해상도에선 Standard가 사실상 OOM되거나 비실용적**.
-
-**솔직한 트레이드오프:**
-
-| Linear가 잃는 것 | Linear가 얻는 것 |
+| 표기 | 뜻 |
 |---|---|
-| 이론적 표현력 (universal approximation) | 메모리 N² → N |
-| Sharp focus 필요한 task (텍스트 렌더링, 정밀한 손가락 수) | 연산 N² → N |
-| → Sana의 알려진 한계와 일치 (텍스트 렌더링·손·얼굴 약함) | 같은 GPU로 더 큰 모델·긴 시퀀스 |
-| | 엣지 디바이스 (4090 INT8 0.37초) 가능 |
+| F32 | spatial downsample이 32배 |
+| C32 | latent channel이 32개 |
+| P1 | DiT patch size가 1 |
 
-#### 정리: Sana의 진짜 기여
+즉:
 
-**Linear attention을 썼다는 게 아니라, Linear attention이 작동하게 만든 시스템 설계.** 구체적으로:
-
-1. **Linear (LiteLA)** 로 self-attention 효율화
-2. **Mix-FFN의 3×3 conv** 로 잃어버린 지역성 보강
-3. **Cross-attention 표준 유지** 로 텍스트-이미지 sharp 매칭은 그대로
-4. **DC-AE의 32× 압축** 으로 토큰 수 자체를 1차로 줄여놓음
-
-이 4가지가 페어로 작동해야 의미 있음. 이전에도 Diffusion에 Linear attention 시도 있었으나 화질 저하로 채택 안 됨 — **Sana가 처음 표준 수준 도달.**
-
-### ③ Mix-FFN (GLUMBConv) — 위치 정보 + 지역성 보강
-
-선형 어텐션의 약점: 표준 softmax 어텐션보다 **지역 패턴 (local pattern)** 캡처가 약함. NoPE까지 더하면 위치 정보도 부족해짐.
-
-**해결:** FFN을 단순 MLP에서 **GLU + MBConv (역방향 residual + 3×3 깊이별 합성곱)** 로 교체.
-
-```
-Mix-FFN = Inverted Residual Block
-       └─ 1×1 conv (expand) → 3×3 depthwise conv → GLU gate → 1×1 conv (project)
+```text
+F32C32P1 = 32배 압축 latent를, patch로 더 묶지 않고 그대로 토큰화
 ```
 
-- **3×3 conv가 지역성 회복**
-- **zero-padding이 절대 위치 단서 (보더 효과)** 를 제공 → positional embedding을 제거해도 (NoPE) 성능 손실 없음
+---
 
-코드 config: `ffn_type: glumbconv`.
+## 7. 핵심 장치 2: Linear DiT와 LiteLA
 
-### ④ Decoder-only LLM Text Encoder (Gemma-2-2B-IT)
+### 7.1 왜 self-attention이 문제인가?
 
-**왜 T5 대신 Gemma인가:**
+표준 attention은 각 토큰이 모든 토큰을 봅니다.
 
-| 비교 | T5-XXL (4.7B) | Gemma-2-2B-IT |
-|---|---|---|
-| 인코딩 속도 | 기준 | **6× 빠름** |
-| Instruction-following | 약함 | 강함 (RLHF 학습됨) |
-| 다국어 | 영어 위주 | 다국어 사전학습 (zero-shot 중국어/이모지 가능) |
-| 추론 메모리 | 큼 | 작음 |
+```text
+N개 토큰이 있으면
+N x N attention score 표를 만든다.
+```
 
-**학습 안정화 트릭 ⭐:** Gemma의 텍스트 임베딩 분산 (variance) 이 T5보다 **수 자릿수 크다** → 그대로 cross-attention에 넣으면 학습 발산 (NaN loss).
+1024개 토큰이면:
+
+```text
+1024 x 1024 = 약 100만 칸
+```
+
+4K에서 DC-AE를 써도 토큰은 16,384개가 됩니다.
+
+```text
+16,384 x 16,384 = 약 2.7억 칸
+```
+
+이게 고해상도에서 full attention이 비싸지는 이유입니다.
+
+### 7.2 Sana의 아이디어
+
+Sana는 self-attention을 LiteLA로 바꿉니다.
+
+```text
+standard attention:
+  softmax(QK^T)V
+
+LiteLA:
+  ReLU(Q), ReLU(K)를 쓰고
+  K와 V를 먼저 합쳐 작은 행렬을 만든 뒤
+  Q에 곱한다.
+```
+
+결과적으로 큰 `N x N` attention matrix를 만들지 않습니다.
+
+### 7.3 Linear Attention을 가장 쉽게 이해하기
+
+표준 attention은 이런 느낌입니다.
+
+```text
+각 학생이 반 전체 학생과 1:1로 비교한다.
+그리고 그 점수를 softmax로 줄 세운다.
+```
+
+학생이 N명이면 비교가 N x N번 필요합니다.
+
+Linear Attention은 이렇게 바꿉니다.
+
+```text
+먼저 반 전체 정보를 요약한 작은 메모장을 만든다.
+각 학생은 그 메모장만 보고 자기 출력을 계산한다.
+```
+
+즉:
+
+```text
+모든 학생과 매번 1:1 비교하지 않는다.
+공통 요약을 한 번 만들고 재사용한다.
+```
+
+이 때문에 비용이 `N^2`에서 `N`에 가까워집니다.
+
+### 7.4 왜 softmax는 어렵고 ReLU는 가능한가?
+
+표준 attention은 한 토큰 `i`의 출력을 대략 이렇게 만듭니다.
+
+```text
+Out_i = 모든 j에 대해
+        softmax(Q_i와 K_j의 점수) x V_j를 더함
+```
+
+문제는 softmax입니다.
+
+softmax는 한 점수만 보고 계산할 수 없습니다.
+
+```text
+전체 j의 점수를 다 본 뒤
+그 안에서 상대적인 비율을 계산해야 한다.
+```
+
+그래서 `N x N` 점수표가 필요합니다.
+
+Sana는 softmax 대신 ReLU 기반 kernel을 씁니다.
+
+```text
+softmax(QK^T)
+  대신
+ReLU(Q)와 ReLU(K)를 따로 계산
+```
+
+이렇게 하면 `K`와 `V`를 먼저 합칠 수 있습니다.
+
+```text
+M = sum_j ReLU(K_j) x V_j
+Out_i = ReLU(Q_i) x M
+```
+
+여기서 `M`은 모든 `i`가 같이 쓰는 작은 요약 행렬입니다.
+
+핵심:
+
+> **softmax는 모든 토큰을 한꺼번에 봐야 하므로 분리하기 어렵고, ReLU는 각 토큰에 따로 적용할 수 있어 계산 순서를 바꿀 수 있습니다.**
+
+### 7.5 Linear Attention만 쓰면 충분한가?
+
+아닙니다.
+
+Linear Attention은 빠르지만 표현력이 조금 약해질 수 있습니다.
+
+특히 특정 위치나 특정 토큰을 아주 날카롭게 찍는 능력은 standard attention보다 약할 수 있습니다.
+
+Sana는 그래서 다음 조합을 씁니다.
+
+```text
+Linear self-attention
++ Mix-FFN의 3x3 convolution
++ standard cross-attention 유지
+```
+
+즉 "Linear Attention 하나로 해결"이 아니라:
+
+> **Linear Attention이 잃는 부분을 Mix-FFN과 cross-attention 설계로 보완한 시스템입니다.**
+
+---
+
+## 8. 핵심 장치 3: Mix-FFN과 NoPE
+
+### 8.1 Mix-FFN이 필요한 이유
+
+이미지는 텍스트보다 지역 패턴이 중요합니다.
+
+예를 들어 얼굴, 손, 옷 주름, 물체 경계 같은 것은 주변 픽셀과 강하게 연결됩니다.
+
+표준 transformer의 FFN은 보통 token마다 독립적인 MLP입니다. 주변 토큰을 직접 보는 구조가 아닙니다.
+
+Sana의 Mix-FFN은 여기에 convolution을 넣습니다.
+
+```text
+1x1 conv
+-> 3x3 depthwise conv
+-> gate
+-> 1x1 conv
+```
+
+이 3x3 conv가 주변 정보를 섞어 줍니다.
+
+### 8.2 NoPE는 무엇인가?
+
+NoPE는 **No Positional Embedding**입니다.
+
+일반 transformer는 토큰 순서나 위치를 알려주기 위해 positional embedding을 넣습니다.
+
+Sana는 별도 positional embedding을 제거합니다.
+
+왜 가능한가?
+
+```text
+Mix-FFN 안의 3x3 conv와 padding이
+위치와 주변 관계에 대한 단서를 어느 정도 제공한다.
+```
+
+그래서 Sana에서는:
+
+```text
+Linear Attention으로 global mixing
+Mix-FFN으로 local mixing과 위치 단서 보강
+```
+
+이 조합이 중요합니다.
+
+---
+
+## 9. 핵심 장치 4: Gemma text encoder와 CHI
+
+### 9.1 왜 decoder-only LLM을 text encoder로 쓰나?
+
+기존 text-to-image 모델은 T5 계열 text encoder를 많이 씁니다.
+
+Sana는 Gemma-2-2B-IT를 씁니다.
+
+장점:
+
+```text
+더 작다.
+더 빠르다.
+instruction-following 능력이 좋다.
+다국어나 복잡한 지시문 처리에 유리하다.
+```
+
+Sana 논문은 Gemma를 단순히 "작은 T5 대체품"으로 보는 것이 아니라, instruction-following LLM으로 활용합니다.
+
+### 9.2 CHI란?
+
+CHI는 **Complex Human Instruction**입니다.
+
+쉽게 말하면:
+
+```text
+사용자 prompt 앞에 긴 시스템 지시문을 붙여
+LLM이 프롬프트를 더 잘 해석하도록 만드는 방법
+```
+
+예:
+
+```text
+사용자 prompt:
+  a cat wearing sunglasses
+
+Gemma에 들어가는 입력:
+  너는 이미지 생성을 위한 prompt를 이해하는 assistant다...
+  아래 설명을 정확히 이미지 조건으로 해석하라...
+  a cat wearing sunglasses
+```
+
+이렇게 하면 text-image alignment가 좋아질 수 있습니다.
+
+### 9.3 Gemma를 붙일 때 생기는 문제
+
+Decoder-only LLM embedding은 기존 T5 embedding과 scale이 다를 수 있습니다.
+
+Sana 논문에서 중요한 관찰:
+
+```text
+Gemma embedding을 그대로 cross-attention에 넣으면
+분산이 너무 커서 학습이 불안정해질 수 있다.
+```
 
 해결:
-- **RMSNorm으로 임베딩 분산을 1.0으로 정규화**
-- **작은 learnable scale factor (초기 0.01)** 적용 → 학습 초기 조심스럽게 통합
-- 코드: `attention_y_norm` ([diffusion/model/nets/sana.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/nets/sana.py))
 
-→ 이 트릭이 **이전 시도들이 실패한 핵심 차이.** Decoder-only LLM을 텍스트 인코더로 쓰려는 시도는 이전에도 있었으나 학습 안정화에서 막혔음.
+```text
+RMSNorm
++ learnable scale을 작게 시작
+```
 
-**CHI (Complex Human Instruction):** 사용자 프롬프트 앞에 시스템 지시문 prepend (예: "You are a prompt expert. Below is a description...") → LLM이 캡션을 정제·확장해서 cross-attention에 전달.
+코드에서는 text feature normalization 관련 설정으로 볼 수 있습니다.
 
-- 52K step 기준: GenEval 45.5 → 47.7 (+2.2)
-- 140K + 5K finetune: 52.8 → 54.8 (+2.0)
-
-### ⑤ Flow-DPM-Solver
-
-기존 Flow Matching 추론은 **Flow-Euler** (1차 적분) → 28~50 step.
-
-**핵심 아이디어:** DDPM은 noise 예측이 보통이지만, Flow Matching은 **velocity (속도) 또는 data 예측**. t ≈ T (순수 노이즈 근처) 에선:
-- noise 예측 → 불안정
-- **data 예측 → 거의 상수처럼 안정**
-
-이 안정성을 살려 **DPM-Solver++** (2차 multistep ODE solver) 의 σ_t 파라미터화를 Flow Matching에 맞게 변환.
-
-→ **14~20 step**으로 동일 품질 달성. 구현: [diffusion/model/dpm_solver.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/dpm_solver.py).
+```text
+attention_y_norm
+```
 
 ---
 
-## 📊 실험 요약
+## 10. 핵심 장치 5: Flow-DPM-Solver
 
-### 1024×1024 메인 결과 (논문 Table 7)
+Sana는 Flow Matching 계열 학습을 사용합니다.
 
-| 모델 | 파라미터 | FID ↓ | CLIP ↑ | GenEval ↑ | DPG ↑ | Latency (s) | 상대 속도 |
-|---|---|---|---|---|---|---|---|
-| FLUX-dev | 12B | 10.15 | 27.47 | 0.67 | 84.0 | 23.0 | 1× |
-| SD3-Medium | 2B | — | — | 0.62 | 84.1 | 4.4 | 5× |
-| PixArt-Σ | 0.6B | 6.15 | 28.26 | 0.54 | 80.5 | 1.5 | 15× |
-| **Sana-0.6B** | 0.6B | **5.81** | 28.36 | 0.64 | 83.6 | **0.9** | **26×** |
-| **Sana-1.6B** | 1.6B | **5.76** | **28.67** | **0.66** | **84.8** | 1.2 | **19×** |
+기본 sampler를 쓰면 품질을 위해 step이 많이 필요할 수 있습니다.
 
-### 4K 생성 (A100, batch=1)
+Sana는 Flow-DPM-Solver를 제안해 step 수를 줄입니다.
 
-- FLUX-dev: 469초
-- **Sana-1.6B: 9.6초 → ~49× 가속** (논문 표기는 100×, 12B 비교 + 추가 최적화 포함)
+직관:
 
-### 엣지 디바이스 (RTX 4090, 1024px)
+```text
+denoising 경로를 더 똑똑하게 적분해서
+비슷한 품질을 더 적은 step으로 얻는다.
+```
 
-- FP16: 0.88초/장
-- **INT8 양자화: 0.37초/장 (2.4× 가속)**
+코드에서는 아래 파일이 관련됩니다.
 
-### 다국어 zero-shot
+```text
+diffusion/model/dpm_solver.py
+```
 
-- 영어로만 학습. Gemma 덕분에 **중국어·이모지 프롬프트도 이해·생성**.
+Sana의 속도는 모델 구조만의 결과가 아닙니다.
 
-### 후속 버전
+```text
+토큰 수 감소
++ attention 비용 감소
++ text encoder 비용 감소
++ sampling step 감소
+```
 
-| 버전 | 출시 | 발표 | 핵심 |
-|---|---|---|---|
-| SANA-1.5 | 2025-01 | ICML 2025 | 4.8B 스케일 업, inference scaling |
-| SANA-Sprint | 2025-03 | ICCV 2025 highlight | sCM distillation, **0.1초 1-step** (H100) |
-| SANA-Video | 2025-10 | ICLR 2026 Oral | Block Causal Linear Attention 비디오 |
-| LongSANA | 2025-12 | — | 720p 27FPS 분 단위 비디오 |
-| Sol-RL | 2026-04 | — | NVFP4 rollout RL, 4.64× 수렴 가속 |
-
-### 한계
-
-- 텍스트 렌더링 (이미지 안 글자) 약함
-- 손·얼굴 디테일 종종 무너짐
-- 학습 데이터 정확 규모 비공개
+이 네 가지가 함께 쌓여서 빠릅니다.
 
 ---
 
-## 💬 Q&A
+## 11. 코드에서 보는 Sana
 
-### Q1. DC-AE는 Sana 안에서 새로 만든 거야, 따로 만든 거야?
+### 11.1 LiteLA
 
-**별도로 새로 학습한 오토인코더.** Sana 자체의 컴포넌트가 아니라 NVIDIA·MIT 같은 그룹이 같은 날 별도 논문으로 공개한 자매 작품.
+LiteLA 구현은 대략 아래 위치에서 볼 수 있습니다.
 
-| 항목 | 내용 |
-|---|---|
-| 논문 | "Deep Compression Autoencoder for Efficient High-Resolution Diffusion Models" |
-| arxiv | [2410.10733](https://arxiv.org/abs/2410.10733) |
-| 저자 | Junyu Chen, Han Cai, Junsong Chen, Enze Xie, Song Han 등 (Sana 저자와 거의 동일) |
-| 공개일 | 2024-10-14 (Sana와 **같은 날**) |
-| 코드 | [mit-han-lab/efficientvit](https://github.com/mit-han-lab/efficientvit) (Sana는 sub-module로 포함) |
-| HF | `mit-han-lab/dc-ae-f32c32-sana-1.1` |
+```text
+diffusion/model/nets/sana_blocks.py
+```
 
-- **scratch 학습** — SD VAE 같은 기존 오토인코더의 깊이만 늘린 게 아니라 **잔차 오토인코딩 (residual autoencoding) + 다단계 학습** 으로 처음부터.
-- Sana 논문에선 "우리는 DC-AE를 사용한다" 인용만 하고 디테일은 자매 논문에.
-- → "DC-AE 논문 + Sana 논문" 짝으로 읽는 게 표준.
-
-### Q2. 토큰 수가 작아져서 메모리가 줄어든 거지?
-
-**1차 동력은 DC-AE의 토큰 수 감소가 맞고, Linear Attention은 그 위에 얹는 2차 효율 레이어.**
-
-| 단계 | 토큰 수 (1024²) | Attention 비용 |
-|---|---|---|
-| 표준 SD VAE (F8) + Standard Attn | 16,384 | ∝ 16,384² ≈ **2.68억** |
-| DC-AE (F32) + Standard Attn | 1,024 | ∝ 1,024² ≈ **105만** |
-| **DC-AE (F32) + Linear Attn (Sana)** | 1,024 | **∝ 1,024 (선형)** |
-
-→ DC-AE가 토큰을 **16× 줄여 attention 비용 256× 감소** (1차 효과)
-→ Linear Attention이 거기서 한 번 더 **O(N²) → O(N)** 으로 1024× 감소 (2차 효과)
-
-**4K에선 Linear Attention의 진가가 폭발:**
-
-| 단계 | 4K 토큰 수 | Attention 비용 |
-|---|---|---|
-| 표준 SD VAE (F8) | 262,144 | ∝ 687억 (사실상 OOM) |
-| DC-AE + Standard | 16,384 | ∝ 2.68억 |
-| **DC-AE + Linear** | 16,384 | **∝ 16,384** |
-
-### Q3. 다른 여러 연구들과 토큰 수 비교?
-
-**1024×1024 입력 — 토큰 수 + per-token 정보량 비교 (코드 직접 검증):**
-
-| 모델 | VAE | DiT patch | **유효 압축률** | 잠재 shape | **토큰 수** | per-token 채널 | 정보량 (토큰×채널) | Attention |
-|---|---|---|---|---|---|---|---|---|
-| SDXL | KL-VAE 8× | – (UNet) | 8× | (4, 128, 128) | 16,384 | 4 | 65,536 | UNet |
-| PixArt-α / Σ | SD VAE 8× | 2 | 16× | (4, 64, 64)→p2 | 4,096 | 16 | 65,536 | Standard |
-| SD3 | 16ch VAE 8× | 2 | 16× | (16, 64, 64)→p2 | 4,096 | 64 | 262,144 | MM-DiT |
-| **FLUX.1-dev** | 16ch VAE 8× | 2 | 16× | (16, 64, 64)→p2 | 4,096 | 64 | 262,144 | MM-DiT |
-| Hunyuan-DiT | SD VAE 8× | 2 | 16× | (4, 64, 64)→p2 | 4,096 | 16 | 65,536 | Standard |
-| HiDream-O1 | 없음 (pixel) | 16 | 16× | (3, 1024, 1024)→p16 | 4,096 | 768 | 3,145,728 | Hybrid |
-| **Z-Image (6B)** | Flux VAE 8× | 2 | 16× | (16, 128, 128)→p2 | 4,096 | 64 | 262,144 | Single-stream full |
-| **Sana-1.6B** | **DC-AE 32×** | 1 | **32×** | (32, 32, 32) | **1,024** | 32 | **32,768** | **Linear (LiteLA)** |
-| **FLUX.2 Klein (4B/9B)** | **VAE 16× + pixel-shuffle 2×** | 1 | **32×** | (128, 32, 32) | **1,024** | 128 | 131,072 | Standard full |
-
-**핵심 관찰:**
-
-1. **Sana ≡ FLUX.2 Klein 토큰 수 동일 (1,024개)** — 두 모델 모두 32× 유효 압축으로 공동 1위. 채널이 32 vs 128로 다를 뿐.
-2. **Sana가 정보량 최저** (32,768) — 가장 가벼운 잠재공간.
-3. **DC-AE 영향력** — Sana (2024-10) 가 32× 압축 처음 도입 → 1년 후 FLUX.2가 더 공격적으로 채택 (2025-11). 단 FLUX.2는 채널을 키우고 attention은 standard 유지 → 다른 길.
-4. **DeepWiki 오답 정정** ⚠️ — DeepWiki는 FLUX.2 VAE를 "64× / 256 토큰"이라 표기하지만 코드 직접 검증 결과 **32× / 1,024 토큰** 이 맞음. (자세한 검증은 Q4)
-
-### Q4. FLUX.2 Klein 코드를 직접 보고 검증한 결과는?
-
-**AutoEncoder ([black-forest-labs/flux2/src/flux2/autoencoder.py](https://github.com/black-forest-labs/flux2/blob/main/src/flux2/autoencoder.py)):**
+핵심 흐름은 이렇게 읽으면 됩니다.
 
 ```python
-@dataclass
-class AutoEncoderParams:
-    ch: int = 128
-    ch_mult: list[int] = [1, 2, 4, 4]    # 4 stages → 16× spatial 다운샘플
-    z_channels: int = 32                  # mean만 추출 (variance 32는 버림)
+q = ReLU(q)
+k = ReLU(k)
 
-# encode 끝부분
-z = rearrange(mean,
-    "... c (i pi) (j pj) -> ... (c pi pj) i j",
-    pi=self.ps[0], pj=self.ps[1])         # ps = [2, 2]
+v = pad(v, value=1)      # 정규화 분모까지 같이 계산하기 위한 trick
+vk = v @ k               # K와 V를 먼저 합친 작은 행렬
+out = vk @ q             # 각 Q에 적용
+out = numerator / denominator
 ```
 
-**1024² 입력 전체 흐름:**
-- conv_in: (B, 128, 1024, 1024)
-- 4 stages 다운샘플 → (B, 512, 64, 64) — **16× 공간 축소**
-- mean 추출 → (B, 32, 64, 64)
-- rearrange `ps=[2,2]` → (B, **32·2·2 = 128**, **64/2 = 32**, **32**)
-- **최종 latent: (B, 128, 32, 32)** ← 32×32 = **1,024 토큰**, per-token 128 채널
+중요한 점:
 
-**유효 압축률 = 1024 / 32 = 32×** (DeepWiki의 64×는 오답)
-
-**Transformer ([black-forest-labs/flux2/src/flux2/model.py](https://github.com/black-forest-labs/flux2/blob/main/src/flux2/model.py)):**
-
-```python
-@dataclass
-class Flux2Params:
-    in_channels: int = 128
-    
-self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=False)
-# patch embedding 없이 토큰별로 단순 Linear → patch_size = 1
-
-F.scaled_dot_product_attention(...)  # Standard full attention
+```text
+softmax가 없다.
+QK^T로 N x N 행렬을 만들지 않는다.
 ```
 
-**Klein 4B vs 9B:** VAE/토큰 수 동일, hidden_size·depth만 다름.
+### 11.2 self-attention과 cross-attention
 
-### Q5. FLUX.2 Klein과 Sana는 토큰 수 같은데 채널 차이가 어떤 의미?
+Sana block은 self-attention과 cross-attention을 다르게 취급합니다.
 
-**같은 1,024 토큰이지만 정보를 다르게 분포시킴.**
+```text
+self-attention:
+  이미지 토큰끼리 보는 부분
+  -> LiteLA 사용
 
-| | Sana | FLUX.2 Klein |
-|---|---|---|
-| 토큰 수 | 1,024 | 1,024 |
-| per-token 채널 | 32 | **128** |
-| 정보량 (토큰×채널) | **32,768** | 131,072 |
-| 압축 메커니즘 | VAE 단독 32× | VAE 16× + pixel-shuffle 2× |
-| 어텐션 | Linear (LiteLA) | Standard full |
-
-**왜 채널이 다른가:**
-- 두 모델 모두 raw VAE 출력은 z_channels=32로 같음
-- FLUX.2는 spatial 정보를 추가로 채널로 옮김 (pixel shuffle 2×2 → 4× 채널 확장) → 32 × 4 = 128
-- Sana는 그 단계 없이 VAE에서 압축 다 끝냄 → 32 채널 그대로
-
-**트레이드오프:**
-- Sana: 채널이 적어서 잠재 표현력 ↓, 대신 모든 게 가벼움 (FFN·linear 비용도 적음)
-- FLUX.2 Klein: 채널이 4× 많아서 표현력 ↑, 대신 토큰별 연산 비용도 4× 무거움
-- **attention의 토큰² 비용은 같지만, FFN·linear projection 비용은 채널에 비례**
-
-### Q6. `softmax(QKᵀ) ≈ φ(Q)·φ(Kᵀ)` 분해가 직관적으로 잘 이해 안 가는데?
-
-→ 자세한 알고리즘·코드는 **② Linear DiT 섹션**에 있고, 여기선 직관만 짚음.
-
-**한 줄 정리:** softmax는 "모든 토큰을 한꺼번에 봐야만 정규화가 끝남" 이라서 N×N 표가 필수. ReLU 같은 단순 함수로 갈아끼우면 "각 토큰 따로 처리" 가 가능해져서, 분배법칙으로 합 순서를 바꿔 N×N 표를 우회할 수 있음.
-
-**왜 softmax는 N²를 강제하는가:**
-
-표준 attention의 한 출력 (i번 토큰의 출력):
-```
-Out_i = Σⱼ  exp(Q_i · K_jᵀ)
-            ─────────────────────  · V_j
-            Σⱼ' exp(Q_i · K_j'ᵀ)        ← 분모가 모든 j'에 의존!
+cross-attention:
+  이미지 토큰이 텍스트 feature를 보는 부분
+  -> standard attention 유지
 ```
 
-분모를 계산하려면 **모든 j'**의 점수를 다 알아야 함. 한 항씩 분리 (= 분배법칙) 불가 → N×N 표를 다 만들어야 분모가 채워짐.
+이 선택이 중요합니다.
 
-**φ로 갈아끼우면 왜 살아나는가:**
+이미지 토큰은 많으므로 linear로 줄이는 효과가 큽니다.
 
-φ가 각 입력에 따로 적용되는 element-wise 함수면 (ReLU 같은):
+텍스트 토큰은 상대적으로 적고, 단어와 이미지 위치의 정확한 연결이 중요하므로 standard attention을 유지합니다.
+
+### 11.3 DC-AE
+
+DC-AE 관련 코드는 아래 경로에서 볼 수 있습니다.
+
+```text
+diffusion/model/dc_ae/efficientvit/models/efficientvit/dc_ae.py
 ```
-Out_i = Σⱼ ReLU(Q_i)ᵀ · ReLU(K_j) · V_j
-      = ReLU(Q_i)ᵀ · ( Σⱼ ReLU(K_j) · V_j )    ← 분배법칙으로 빼낼 수 있음!
-                      ─────────────────────
-                      M = i와 무관한 d×d 행렬 ⭐
+
+Sana가 쓰는 핵심 설정은:
+
+```text
+F32C32
 ```
 
-→ M (= Σⱼ φ(K_j)V_j) 을 **한 번만 계산해두면 모든 i가 재사용**. **N×N 표 안 만들어도 됨.**
+즉:
 
-**가게 비유:**
+```text
+32x spatial compression
+32 latent channels
+```
 
-| | 표준 Attention (softmax) | Linear Attention (ReLU) |
-|---|---|---|
-| 비유 | "1:1 면접 후 줄세우기" | "점원이 미리 요약 카드 만들어두기" |
-| 흐름 | 손님 i가 점원 N명과 만나 점수 매김 → softmax 정규화 | 점원들이 (K_j, V_j) 를 ReLU 변환해 합산 카드 M 미리 작성 |
-| 손님당 비용 | N명 만남 (softmax 위해 다른 점원 다 봐야) | M 카드 1장만 보기 |
-| 전체 비용 | **N² 만남** | **N 만남** |
-| 카드 재사용 | 불가 (매번 새로) | **모든 손님이 재사용** ⭐ |
+### 11.4 Flow-DPM-Solver
 
-핵심 한 줄: **"각 토큰을 따로 처리할 수 있는 함수"** 로 갈아끼우는 게 전부. softmax는 묶어서 봐야 정규화되므로 분리 불가, ReLU는 각자 처리 가능해 분리 가능.
+Sampler 쪽은 아래 파일을 보면 됩니다.
 
-### Q7. Linear Attention의 성능은 표준 attention과 비교해서 어때?
+```text
+diffusion/model/dpm_solver.py
+```
 
-→ 자세한 표·수치는 **② Linear DiT 섹션 "성능 비교"** 에 있음. 핵심만 요약.
+여기서 중요한 관점은:
 
-**솔직한 결론: 단독으론 약간 떨어지지만, Sana 시스템 안에선 더 우수.**
+```text
+모델 forward 1번의 비용도 줄이고,
+필요한 forward 횟수도 줄인다.
+```
 
-| 시나리오 | 결과 |
+입니다.
+
+---
+
+## 12. 실험 결과를 어떻게 읽어야 하나?
+
+### 12.1 1024x1024 결과
+
+논문과 저장소 README의 숫자를 요약하면, Sana는 작은 파라미터 수로도 매우 빠릅니다.
+
+| 모델 | 파라미터 | Latency | FID | GenEval | DPG |
+|---|---:|---:|---:|---:|---:|
+| FLUX-dev | 12B | 23.0s | 10.15 | 0.67 | 84.0 |
+| Sana-0.6B | 0.6B | 0.9s | 5.81 | 0.64 | 83.6 |
+| Sana-1.6B | 1.6B | 1.2s | 약 5.8-5.9 | 약 0.66-0.69 | 약 84.5-84.8 |
+
+숫자 해석:
+
+```text
+Sana는 FLUX-dev보다 훨씬 작고 빠르지만,
+텍스트-이미지 alignment 지표는 꽤 근접한다.
+```
+
+단, metric만 보고 "항상 FLUX보다 낫다"고 읽으면 안 됩니다. 모델 크기, 데이터, aesthetic preference, prompt 종류에 따라 체감 품질은 달라질 수 있습니다.
+
+### 12.2 4K 결과
+
+Sana가 특히 강조하는 지점은 4K입니다.
+
+고해상도로 갈수록 standard attention의 `N^2` 비용이 커집니다.
+
+Sana는:
+
+```text
+DC-AE로 토큰 수를 줄이고
+Linear Attention으로 attention 비용 증가를 완화한다.
+```
+
+그래서 4K에서 상대 속도 이득이 더 커집니다.
+
+### 12.3 RTX 4090 / laptop GPU 의미
+
+Sana는 "거대 서버 GPU에서만 되는 모델"이 아니라, 16GB급 GPU나 consumer GPU에서도 돌릴 수 있는 효율성을 강조합니다.
+
+이것이 Sana의 실용적 의미입니다.
+
+```text
+품질만 최고로 끌어올린 논문이라기보다
+고해상도 생성 비용을 낮추는 시스템 논문
+```
+
+---
+
+## 13. Sana의 기여를 한 번에 정리
+
+Sana의 기여는 "Linear Attention을 썼다" 하나로 요약하면 부족합니다.
+
+정확히는 아래 조합입니다.
+
+| 기여 | 역할 |
 |---|---|
-| Linear 단독 vs Standard 단독 | Linear이 **1~3% 떨어짐** (FID 6.0 → 6.5, GenEval 0.51 → 0.49) |
-| Linear + Mix-FFN vs Standard | **Linear+Mix-FFN이 더 우수** (FID 5.9, GenEval 0.55) |
-| 속도 | **Linear이 30% 빠름** |
-| 1024² 실전 (Sana-1.6B vs FLUX-12B) | FID 5.76 vs 10.15 (**Sana 우수**), GenEval 0.66 vs 0.67 (거의 동등, **20분의 1 파라미터**), Latency **19× 빠름** |
-| **4K 실전** | FLUX-dev 469초 vs Sana 9.6초 → **49× 가속** (Standard는 사실상 OOM 임계점) |
+| DC-AE 32x | 이미지 latent token 수를 크게 줄임 |
+| LiteLA | self-attention의 `N^2` 비용을 줄임 |
+| Mix-FFN | Linear Attention이 약해질 수 있는 지역 정보를 보강 |
+| standard cross-attention 유지 | 텍스트와 이미지의 sharp alignment를 보존 |
+| Gemma text encoder | 작은 decoder-only LLM으로 prompt 이해 강화 |
+| CHI | instruction을 붙여 text-image alignment 개선 |
+| Flow-DPM-Solver | sampling step 감소 |
 
-**왜 LLM에선 Linear이 안 통하는데 이미지에선 잘 되나:**
+가장 중요한 문장:
 
-| | LLM (텍스트) | Diffusion (이미지) |
-|---|---|---|
-| Attention 패턴 | Sharp (정확한 토큰 retrieval 필요) | Soft (인접 픽셀을 부드럽게) |
-| Linear 적합성 | 약함 (sharp focus 손실 치명적) | 좋음 (본래 부드러운 패턴) |
-
-→ **이미지 attention 패턴이 본래 부드러워서** Linear의 약점이 큰 문제가 안 됨. Mix-FFN의 conv가 지역성을 채워주면 표준과 동등.
-
-**Sana의 진짜 기여:** "Linear attention을 썼다"가 아니라 **"Linear이 작동하게 만드는 시스템 설계"** (Linear + Mix-FFN + cross-attn 표준 유지 + DC-AE 토큰 사전 압축). 이전에도 Diffusion에 Linear attention 시도들 있었으나 화질 저하로 채택 안 됨 — **Sana가 처음 표준 수준 도달.**
-
-**솔직한 트레이드오프 (Sana의 알려진 한계와 일치):**
-- 잃는 것: sharp focus 필요한 task (텍스트 렌더링, 정밀한 손가락 수)
-- 얻는 것: 메모리 N²→N, 4K 실시간 가능, 엣지 디바이스 배포
-
-### Q8. 백본 분류표 (reference_pretrained_backbone_reuse_landscape) 기준 어디?
-
-**DiT 본체는 scratch + 텍스트 인코더만 (C) 분기 LLM 재사용 하이브리드.**
-
-| Sana의 컴포넌트 | 출처 | 분기 |
-|---|---|---|
-| **DC-AE** (오토인코더) | scratch 학습 (별도 논문) | 분기 외 (새로 만듦) |
-| **Linear DiT** | scratch 학습 | 분기 외 (새로 만듦) |
-| **Gemma-2-2B-IT** (텍스트 인코더) | Google 사전학습 LLM 그대로 사용 | (C) 분기 — LLM 재사용 |
-
-→ 가장 가까운 비교 대상: **PixArt-Σ** (DiT scratch + T5). Sana는 여기서:
-- T5 → Gemma (텍스트 인코더 교체)
-- full attention → linear attention
-- F8 VAE → F32 DC-AE
-- positional embedding → NoPE
-
-→ "PixArt-Σ 계열의 효율 극단화 + (C) 분기 LLM 텍스트 인코더 도입" 의 하이브리드.
-
-### Q9. 왜 0.6B/1.6B로 작게 만들었나? 더 키우면 안 되나?
-
-**Sana의 설계 철학은 "SOTA보다 효율".** 소형 모델로 4K를 빠르게가 목표.
-
-- 후속작 SANA-1.5에서 **4.8B**로 키우긴 했지만 (ICML 2025)
-- 핵심 가치는 **RTX 4090 같은 소비자 GPU에서도 1초 안에 1024² 생성**
-- SANA-Sprint는 더 나아가 **0.1초 1-step 생성** (H100)
+> **Sana의 진짜 기여는 Linear Attention 단품이 아니라, Linear Attention이 이미지 생성에서 실제로 품질을 잃지 않도록 만든 전체 시스템 설계입니다.**
 
 ---
 
-## 🎁 한 줄 요약 (전체)
+## 14. DMD/DMD2와의 연결
 
-**Sana = (DC-AE 32×) × (Linear DiT LiteLA) × (Gemma-2 텍스트 인코더) × (Flow-DPM-Solver)** — 네 가지 효율 컴포넌트의 곱셈으로 **0.6B 모델이 FLUX-12B보다 26× 빠르면서 GenEval 동급**, 4K 이미지를 10초에 생성하는 완전 오픈소스 (Apache-2.0) 시스템. 코드 검증 결과 토큰 수에서 FLUX.2 Klein과 공동 1위 (1,024개), 정보량은 단독 1위로 가장 가벼움.
+DMD/DMD2를 먼저 읽었다면 Sana는 조금 다르게 봐야 합니다.
 
-**Sana의 진짜 기여:** "Linear attention을 썼다"가 아니라 **"Linear attention이 작동하게 만든 시스템 설계"** — softmax를 ReLU로 갈아끼워 분배법칙을 살리고 행렬곱 순서를 (Q·K)·V에서 Q·(K·V)로 바꿔 O(N²)→O(N)을 달성하되, Mix-FFN의 3×3 conv로 잃어버린 지역성을 정확히 보상하고, cross-attention은 표준 유지로 텍스트 sharp 매칭을 챙기며, DC-AE의 32× 압축으로 토큰 수 자체를 1차로 줄여놓음. 이 4박자가 페어로 작동해 처음으로 Diffusion에서 Linear attention이 표준 수준 화질을 달성한 사례.
+| 항목 | DMD/DMD2 | Sana |
+|---|---|---|
+| 목적 | 느린 teacher를 빠른 student로 증류 | 처음부터 빠른 diffusion backbone 설계 |
+| 핵심 질문 | 많은 step을 1-step/4-step으로 줄일 수 있나? | 고해상도 DiT의 token/attention 비용을 줄일 수 있나? |
+| 주요 대상 | student generator 학습 | text-to-image 모델 구조 |
+| 핵심 장치 | score matching, critic, GAN loss, backward simulation | DC-AE, Linear Attention, Mix-FFN, Gemma, solver |
+| 속도 개선 위치 | 추론 step 수 | 토큰 수, attention 비용, text encoder, sampler |
+
+공통점도 있습니다.
+
+```text
+둘 다 diffusion을 더 싸고 빠르게 만들려는 연구다.
+```
+
+하지만 줄이는 비용의 종류가 다릅니다.
+
+```text
+DMD/DMD2:
+  denoising step 수를 줄인다.
+
+Sana:
+  step 하나하나의 계산 비용을 줄이고,
+  sampler step도 줄인다.
+```
 
 ---
 
-## 🔗 관련 메모리
+## 15. 다른 모델과 비교해서 이해하기
 
-- [[reference_pretrained_backbone_reuse_landscape]] — Sana는 DiT scratch + (C) 분기 LLM 텍스트 인코더 재사용 하이브리드
-- [[paper_z_image]] — 비교: 정통 DiT (4K 토큰) + 데이터·distillation으로 효율 달성 (다른 길)
-- [[paper_hidream_o1_image]] — 대조: VAE/텍스트 인코더 모두 제거 vs Sana는 둘 다 유지·갈아끼움
-- [[paper_mv_split_dit]] — 대조: 깊이로 키우는 안정화 vs Sana는 가로(토큰·연산)로 줄이는 효율화
-- [[feedback_paper_summary_format]] — 본 문서 작성 형식
-- [[feedback_beginner_friendly_tone]] — 본 문서 표현 톤
+### 15.1 PixArt 계열과의 관계
+
+Sana는 PixArt 계열과 비교하면 이해하기 쉽습니다.
+
+```text
+PixArt:
+  SD VAE 8x
+  standard attention DiT
+  T5 text encoder
+
+Sana:
+  DC-AE 32x
+  linear attention DiT
+  Gemma text encoder
+```
+
+즉 Sana는 PixArt류 효율형 DiT를 더 극단적으로 밀어붙인 모델로 볼 수 있습니다.
+
+### 15.2 FLUX와의 관계
+
+FLUX는 더 큰 모델과 강한 full attention 계열 설계로 고품질을 노립니다.
+
+Sana는 더 작은 모델과 효율 구조로 속도와 고해상도 확장성을 노립니다.
+
+```text
+FLUX:
+  크고 강한 모델
+  비용 큼
+  품질 강함
+
+Sana:
+  작고 빠른 모델
+  고해상도 비용 낮음
+  효율 강함
+```
+
+둘은 같은 목표를 다른 방식으로 푼 사례입니다.
+
+### 15.3 백본 재사용 관점
+
+Sana의 DiT 본체는 scratch로 학습됩니다.
+
+하지만 text encoder는 Gemma-2-2B-IT라는 pretrained LLM을 가져옵니다.
+
+따라서 백본 재사용 관점에서는:
+
+```text
+DiT 본체: scratch
+DC-AE: 별도 학습된 컴포넌트 사용
+Text encoder: pretrained Gemma 재사용
+```
+
+가장 가까운 분류는:
+
+```text
+DiT scratch + LLM text encoder 재사용 하이브리드
+```
+
+---
+
+## 16. 한계
+
+Sana가 빠르다고 해서 모든 면에서 완벽한 것은 아닙니다.
+
+논문과 공개 사례 기준으로 주의할 한계:
+
+```text
+이미지 안의 글자 렌더링은 여전히 어렵다.
+손, 얼굴, 작은 디테일은 깨질 수 있다.
+Linear Attention은 sharp focus가 필요한 상황에서 약할 수 있다.
+학습 데이터 세부 규모와 구성은 완전히 투명하지 않다.
+```
+
+이 한계는 구조와도 연결됩니다.
+
+```text
+DC-AE 32x:
+  정보량을 줄이는 대신 아주 미세한 디테일이 어려울 수 있음
+
+Linear Attention:
+  비용을 줄이는 대신 sharp token matching은 standard attention보다 약할 수 있음
+```
+
+즉 Sana는:
+
+```text
+최고 품질만을 위해 모든 비용을 쓰는 모델
+```
+
+이라기보다:
+
+```text
+품질과 비용 사이의 균형을 공격적으로 최적화한 모델
+```
+
+입니다.
+
+---
+
+## 17. 자주 헷갈리는 질문
+
+### Q1. Sana는 DMD 같은 distillation 논문인가?
+
+아닙니다.
+
+Sana 원논문은 주로 효율적인 text-to-image backbone 설계 논문입니다.
+
+DMD/DMD2는 이미 있는 느린 teacher를 빠른 student로 줄이는 증류 방법입니다.
+
+Sana는:
+
+```text
+토큰 수를 줄이고
+attention 비용을 줄이고
+text encoder와 sampler를 효율화한다.
+```
+
+### Q2. 속도 향상의 가장 큰 이유는 Linear Attention인가?
+
+Linear Attention도 중요하지만, 1차 효과는 DC-AE의 토큰 수 감소입니다.
+
+1024px 기준:
+
+```text
+8x VAE:
+  128 x 128 = 16,384 tokens
+
+32x DC-AE:
+  32 x 32 = 1,024 tokens
+```
+
+여기서 이미 토큰 수가 16배 줄어듭니다.
+
+그 다음 Linear Attention이 남은 token들에 대해 `N^2` 비용을 더 줄입니다.
+
+정리:
+
+```text
+DC-AE = 토큰 수 자체를 줄임
+LiteLA = 남은 토큰의 attention 비용을 줄임
+```
+
+둘 다 필요합니다.
+
+### Q3. Linear Attention이면 품질이 무조건 떨어지지 않나?
+
+단독으로는 떨어질 수 있습니다.
+
+Sana의 핵심은 Linear Attention 단독이 아니라:
+
+```text
+Linear Attention
++ Mix-FFN
++ standard cross-attention
++ DC-AE
+```
+
+입니다.
+
+이미지 생성에서는 지역 패턴이 중요하기 때문에 Mix-FFN의 convolution이 큰 도움이 됩니다.
+
+### Q4. 왜 cross-attention은 standard로 남겼나?
+
+텍스트 토큰 수는 이미지 토큰 수보다 훨씬 적습니다.
+
+그리고 text-image alignment는 특정 단어와 특정 이미지 영역을 정확히 연결해야 합니다.
+
+그래서 Sana는:
+
+```text
+비싼 이미지 self-attention만 linear로 줄이고,
+중요한 text cross-attention은 standard로 유지한다.
+```
+
+### Q5. DC-AE는 Sana가 직접 만든 건가?
+
+Sana 팀과 겹치는 저자들이 별도 자매 논문에서 만든 오토인코더입니다.
+
+Sana는 그 DC-AE를 가져다 사용합니다.
+
+관련 논문:
+
+```text
+Deep Compression Autoencoder for Efficient High-Resolution Diffusion Models
+arXiv: 2410.10733
+```
+
+### Q6. Gemma text encoder는 왜 안정화가 필요했나?
+
+Gemma의 text embedding scale이 기존 T5 계열과 다르기 때문입니다.
+
+그대로 cross-attention에 넣으면 학습 초기에 값이 너무 커져 불안정해질 수 있습니다.
+
+Sana는:
+
+```text
+RMSNorm
++ learnable scale
+```
+
+로 text feature를 안정화합니다.
+
+### Q7. Sana의 한계를 구조적으로 어떻게 이해하면 되나?
+
+Sana는 비용을 줄이기 위해 정보를 강하게 압축하고 attention을 선형화합니다.
+
+그래서:
+
+```text
+큰 구조, 전체 장면, 일반적인 prompt alignment는 잘할 수 있지만
+작은 글자, 손가락, 얼굴 디테일처럼 sharp하고 미세한 정보는 어려울 수 있다.
+```
+
+라고 이해하면 됩니다.
+
+---
+
+## 18. 핵심 용어 사전
+
+| 용어 | 쉬운 뜻 |
+|---|---|
+| DC-AE | 이미지를 32배 압축하는 오토인코더 |
+| F32C32 | 32배 spatial 압축, latent channel 32개 |
+| DiT | Diffusion Transformer |
+| Linear Attention | `N x N` attention matrix를 만들지 않는 attention 계열 |
+| LiteLA | Sana가 쓰는 ReLU 기반 Linear Attention |
+| Mix-FFN | FFN 안에 3x3 convolution을 넣어 지역 정보를 보강하는 모듈 |
+| NoPE | 별도 positional embedding을 쓰지 않는 설계 |
+| Cross-Attention | 이미지 토큰이 텍스트 feature를 참고하는 attention |
+| Gemma-2-2B-IT | Sana의 decoder-only LLM text encoder |
+| CHI | prompt 앞에 복잡한 instruction을 붙이는 방법 |
+| Flow Matching | noise에서 image로 가는 경로를 학습하는 diffusion 계열 방법 |
+| Flow-DPM-Solver | Flow Matching 모델을 적은 step으로 샘플링하기 위한 solver |
+| rFID | 오토인코더 복원 품질 지표. 낮을수록 좋음 |
+| GenEval | 텍스트와 이미지의 객체/속성 정합성 평가 |
+| DPG-Bench | 긴 prompt 이해를 평가하는 benchmark |
+
+---
+
+## 19. 전체 요약
+
+Sana를 한 줄로 다시 쓰면:
+
+> **Sana는 "고해상도 DiT가 느린 이유는 토큰 수와 attention 비용 때문"이라고 보고, DC-AE 32x 압축과 Linear Attention을 중심으로 전체 text-to-image 시스템을 가볍게 재설계한 모델입니다.**
+
+가장 중요한 흐름:
+
+```text
+1. DC-AE가 1024px 이미지를 32x32 latent token으로 줄인다.
+2. Linear DiT가 self-attention을 O(N^2)에서 O(N)에 가깝게 줄인다.
+3. Mix-FFN이 Linear Attention의 약한 지역성을 보완한다.
+4. Cross-attention은 standard로 남겨 텍스트 정합성을 챙긴다.
+5. Gemma text encoder와 CHI가 prompt 이해를 강화한다.
+6. Flow-DPM-Solver가 sampling step을 줄인다.
+```
+
+따라서 Sana의 핵심은:
+
+```text
+Linear Attention을 썼다
+```
+
+가 아니라:
+
+```text
+Linear Attention이 실제 이미지 생성에서 쓸 수 있도록
+압축, FFN, cross-attention, text encoder, sampler를 함께 설계했다
+```
+
+입니다.
+
+---
+
+## 20. 관련 문서
+
+- [PAPER_DMD.md](PAPER_DMD.md) - diffusion distillation의 기본 아이디어
+- [PAPER_DMD2.md](PAPER_DMD2.md) - DMD의 후속, 1-step/4-step fast synthesis
+- [PAPER_PixArt-alpha.md](PAPER_PixArt-alpha.md) - 효율형 DiT 계열 비교
+- [PAPER_Z-Image.md](PAPER_Z-Image.md) - DiT, DMD 계열, RLHF를 결합한 후속 대형 모델 흐름
+- Sana 논문: https://arxiv.org/abs/2410.10629
+- Sana 코드: https://github.com/NVlabs/Sana
