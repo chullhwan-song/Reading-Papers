@@ -293,18 +293,22 @@ pos_id = [role_id, y, x]
 Any2AnyTryon의 핵심 규칙은 이겁니다.
 
 ```text
-target   -> role_id = 0
-cond_spa -> role_id = 1
-cond_sub -> role_id = 2
+target -> role_id = 0
+
+조건 영역은 등장 순서대로 role_id가 붙는다.
+  cond_spa가 있으면 cond_spa -> role_id = 1
+  cond_sub가 있으면 cond_sub -> 다음 role_id
 ```
 
-즉 모델 입장에서는 모든 이미지 토큰이 한 줄로 이어져 들어오지만, 각 토큰에는 이런 이름표가 붙습니다.
+표준 try-on처럼 `cond_spa`와 `cond_sub`가 둘 다 있으면 다음과 같습니다.
 
 ```text
 [0, y, x] = target token
 [1, y, x] = spatial condition token
 [2, y, x] = subject condition token
 ```
+
+하지만 garment reconstruction이나 model-free try-on처럼 `cond_spa`가 없고 `cond_sub`만 있으면, `cond_sub`는 첫 번째 조건이므로 `role_id = 1`을 받습니다.
 
 이것이 논문 제목의 Adaptive Position Embedding입니다.
 
@@ -349,8 +353,9 @@ cond_sub x = W_tgt ... W_tgt + W_sub
 | 영역 | `role_id` | `y` | `x` |
 |---|---:|---|---|
 | `target` | 0 | 0 ... H | 0 ... W_tgt |
-| `cond_spa` | 1 | 0 ... H | 0 ... W_spa |
-| `cond_sub` | 2 | 0 ... H | W_tgt ... W_tgt + W_sub |
+| `cond_spa` | 1, 있으면 | 0 ... H | 0 ... W_spa |
+| `cond_sub` | 2, `cond_spa`도 있으면 | 0 ... H | W_tgt ... W_tgt + W_sub |
+| `cond_sub` | 1, `cond_spa`가 없으면 | 0 ... H | W_tgt ... W_tgt + W_sub |
 
 일반 텍스트 수식으로 쓰면:
 
@@ -507,12 +512,14 @@ latent_image_ids[..., 0] = 0
 latent_image_ids[..., 1] = y
 latent_image_ids[..., 2] = x
 
-# cond_spa: role_id = 1, x는 0부터 시작
+# cond_spa: 있으면 role_id = 1, x는 0부터 시작
 condspa_image_ids[..., 0] = 1
 condspa_image_ids[..., 2] = x
 
-# cond_sub: role_id = 2, x는 target width만큼 offset
-condsub_image_ids[..., 0] = 2
+# cond_sub: 다음 role_id, x는 target width만큼 offset
+#   cond_spa가 있으면 2
+#   cond_spa가 없으면 1
+condsub_image_ids[..., 0] = next_condition_id
 condsub_image_ids[..., 2] = x + width_tgt
 ```
 
@@ -777,6 +784,8 @@ cond_sub:
   x는 target 오른쪽으로 offset
 ```
 
+위 도식은 표준 try-on처럼 두 조건이 모두 있는 경우입니다. `cond_spa`가 없으면 `cond_sub`의 숫자는 2가 아니라 1이지만, x 좌표는 여전히 target 오른쪽으로 offset됩니다.
+
 이 설계의 직관:
 
 ```text
@@ -827,6 +836,8 @@ target:
 
 `<MODEL>`, `<GARMENT>`, `<TARGET>`은 prompt 문장을 의미 단위로 나누기 위한 텍스트 convention에 가깝습니다.
 
+이 결론을 뒷받침하는 실증 증거는 Q8 참조.
+
 ### Q3. CatVTON보다 항상 좋은가?
 
 아닙니다.
@@ -871,7 +882,7 @@ target만 denoise하면 됨
 
 ```text
 1. condition_subject_image는 기본적으로 한 장 슬롯이다.
-2. cond_sub 전체가 role_id = 2 하나로 묶인다.
+2. cond_sub 전체가 하나의 같은 role_id로 묶인다.
 3. 옷별로 다른 role_id를 주는 구조가 아니다.
 4. 공개 multi 체크포인트는 multi-garment "추출"용이다.
 5. 논문 평가는 multi-item simultaneous try-on을 정량 평가하지 않는다.
@@ -883,6 +894,8 @@ target만 denoise하면 됨
 1차: 사람 + 티셔츠 -> 티셔츠 입은 사람
 2차: 티셔츠 입은 사람 + 자켓 -> 티셔츠 위에 자켓 입은 사람
 ```
+
+이게 왜 구조적으로 막혀 있는지(`role_id` 측면)는 Q9 참조. layered 학습 방식은 Q7 참조.
 
 ### Q6. 학습 prompt는 어떻게 만들어야 하나?
 
@@ -914,6 +927,284 @@ jsonl 예:
 
 코드에서는 prompt가 리스트면 epoch마다 랜덤으로 하나를 고를 수 있습니다.
 
+### Q7. try-on in layers는 어떻게 학습했나?
+
+논문 4.1과 4.5에 따르면 이렇게 처리했습니다.
+
+**a. 2단계 학습 (curriculum)**
+
+```text
+1단계: layered 제외한 모든 태스크
+         (표준 try-on, garment reconstruction, model-free) 학습
+2단계: layered 데이터 + 1단계 태스크의 일부 subset 으로 fine-tune
+```
+
+layered 만 따로 학습한 게 아니라, **이미 잘 학습된 통합 모델 위에 layered 데이터를 끼얹어 추가 학습**합니다. 한꺼번에 학습하면 layered가 다른 태스크 학습을 흔드는 문제를 회피하려는 의도로 보입니다.
+
+**b. 슬롯 구조는 표준 try-on과 동일**
+
+새 슬롯을 추가하지 않습니다. 데이터와 prompt만 다릅니다.
+
+```text
+cond_spa = 이미 옷 A 를 입은 모델 사진
+cond_sub = 위에 덧입을 옷 B 한 벌
+prompt   = "옷 A 위에 옷 B 를 덧입혀라" 같은 자연어 지시
+target   = 옷 A + 옷 B 를 같이 입은 모델
+```
+
+옷이 한 벌만 새로 들어가므로 Q9의 "여러 옷이면 role_id가 똑같다" 문제가 안 걸립니다.
+
+**c. mask-free라서 더 어렵다**
+
+논문 본문 인용:
+
+> The try-on-in-layer task is very challenging, especially for mask-free try-on, as the method must identify specific editing locations only with text guidance.
+
+```text
+일반 try-on : 옷 영역이 명확 (상의 swap 이면 상의 영역만 바꿈)
+layered     : 기존 옷을 어디까지 살릴지를 prompt 만으로 결정
+              -> "안에 입은 옷은 그대로, 그 위에 덧입어라"
+                 라는 의미를 자연어에서 모델이 읽어내야 함
+```
+
+mask가 없으니 어디에 옷을 추가할지를 prompt가 짚어줘야 합니다. 학습 난이도가 높아지는 이유입니다.
+
+**d. 평가는 정성 비교만**
+
+```text
+비교 대상: DiOr (Cui et al., 2021), "dressing in order"
+방식    : DiOr 원본 논문의 예시 입력을 가져와 본 모델로 재생성
+결과    : Figure 7 의 정성적 비교
+정량 지표: 없음
+```
+
+LPIPS·SSIM·FID 같은 정량 지표가 layered에 대해 표로 제시되지 않습니다.
+
+**e. 추론 시 LoRA 선택**
+
+체크포인트 4종 중 `dev_lora_any2any_alltasks.safetensors` 만 layered를 포함합니다. `_tryon` / `_garment_reconstruction` / `_multi` 에는 layered 능력이 없거나 약합니다.
+
+### Q8. `<MODEL>`, `<GARMENT>`, `<TARGET>`이 진짜 이미지 슬롯 인덱스가 아니라는 실증
+
+세 가지 증거가 있습니다.
+
+**증거 1: validation_preset.jsonl의 실제 prompt에 등장 횟수 0번**
+
+`asset/images/validation_preset.jsonl`은 저자가 학습·검증에 사용한 공식 prompt입니다.
+
+```json
+{"condition_spatial": "model3.png", "condition_subject": "garment3.png", "prompt": "Change her dress to brown dress"}
+{"condition_spatial": "model4.png", "condition_subject": "garment4.jpg", "prompt": "Change her pants to plaid trousers."}
+{"condition_spatial": null,         "condition_subject": "model1.png",   "prompt": "A plaid shirt"}
+{"condition_spatial": null,         "condition_subject": "garment3.jpg", "prompt": "A smiling woman with the garment walking on the street"}
+```
+
+```text
+<MODEL>   등장 횟수 : 0
+<GARMENT> 등장 횟수 : 0
+<TARGET>  등장 횟수 : 0
+```
+
+만약 정식 슬롯 토큰이었다면 학습·검증 prompt에 반드시 등장해야 합니다. 그런데 없습니다.
+
+**증거 2: 이미지는 prompt가 아니라 별도 CLI 인자로 들어간다**
+
+```text
+infer.py CLI
+  --model_image   -> condition_spatial_image -> cond_spa
+  --garment_image -> condition_subject_image -> cond_sub
+  --prompt        default=""  (비워도 추론 동작)
+```
+
+`--prompt`가 비어도 추론이 돕니다. `<MODEL>`이 진짜 슬롯 인덱스라면 prompt 없이는 슬롯 매칭이 깨져야 하는데, 그렇지 않습니다.
+
+**증거 3: 코드상 special token 등록 근거가 없다**
+
+이 토큰들이 진짜 이미지 슬롯이라면 보통 다음 중 하나가 있어야 합니다.
+
+```text
+1. tokenizer.add_special_tokens(...)
+2. special token embedding resize
+3. prompt parser가 <MODEL> / <GARMENT> / <TARGET>을 이미지 슬롯으로 해석
+```
+
+하지만 공개 코드의 입력 경로는 이미지 슬롯을 CLI 인자와 JSON 필드로 정합니다. 따라서 `<MODEL>`, `<GARMENT>`, `<TARGET>`은 정식 특수 토큰이라기보다 prompt 텍스트를 의미 단위로 나눈 시각적 separator로 보는 편이 안전합니다.
+
+### Q9. `cond_sub` 슬롯에 옷이 여러 벌이면 role_id는 어떻게 되나?
+
+핵심 결론: **모든 옷이 cond_sub 슬롯의 같은 role_id를 받습니다. 옷별로 다른 ID가 부여되지 않습니다.**
+
+표준 try-on처럼 `cond_spa`도 있으면 cond_sub의 role_id는 2입니다. `cond_spa`가 없고 `cond_sub`만 있으면 cond_sub의 role_id는 1입니다.
+
+**a. 코드의 실제 동작**
+
+```text
+src/utils.py 의 prepare_latent_image_ids:
+
+cond_mark = 0
+
+if width_spa > 0:
+    cond_mark += 1                # -> 1
+    cond_spa 영역 전체 role_id = 1
+
+if width_sub > 0:
+    cond_mark += 1                # -> cond_spa가 있으면 2, 없으면 1
+    cond_sub 영역 전체 role_id = cond_mark
+```
+
+`cond_mark`는 **슬롯 영역 단위로 한 번만 증가**합니다. 그래서 cond_sub 영역 전체에 같은 값이 칠해집니다.
+
+**b. 옷 N벌을 넣으려면 단일 cond_sub 슬롯에 가로로 이어 붙여야 한다**
+
+```text
+cond_sub 영역 = [ 옷1 | 옷2 | ... | 옷N ]  가로로 concat
+                 W1     W2          WN
+width_sub = W1 + W2 + ... + WN
+```
+
+이때 N벌 모두에 부여되는 좌표:
+
+| 옷 | role_id | y | x |
+|---|---:|---|---|
+| 옷1 | same cond_sub id | 0 ... H | W_tgt ... W_tgt + W1 |
+| 옷2 | same cond_sub id | 0 ... H | W_tgt + W1 ... W_tgt + W1 + W2 |
+| 옷3 | same cond_sub id | 0 ... H | W_tgt + W1 + W2 ... |
+
+```text
+모든 옷의 role_id = cond_sub 슬롯 ID  (동일)
+옷별로 다른 것은 x 좌표뿐
+```
+
+**c. 실제로 무엇이 일어나는가**
+
+```text
+서로 다른 카테고리 (옷1=셔츠, 옷2=바지)
+  -> 옷의 모양 자체가 상의/하의 단서가 됨
+  -> prompt 의 "shirt", "pants" 등이 시각적으로 매칭
+  -> 그럭저럭 동작할 수 있음
+
+같은 카테고리 (옷1=빨간 셔츠, 옷2=파란 셔츠)
+  -> 둘 다 상의 모양, role_id 도 같음
+  -> 모델 입장에서 두 옷은 거의 호환됨
+  -> 한 옷이 다른 옷에 흡수되거나 두 옷이 섞이는 경향
+```
+
+**d. 진짜로 옷별 인덱싱을 하려면**
+
+코드를 이렇게 고쳐야 합니다.
+
+```python
+# 현재 (단일 mark)
+condsub_image_ids[..., 0] = cond_mark    # cond_sub 영역 전체가 같은 값
+
+# 옷별 mark 부여
+for k, (h_k, w_k) in enumerate(garment_sizes):
+    block_ids[..., 0] = cond_mark + k    # 옷1=2, 옷2=3, ...
+```
+
+그러나:
+
+```text
+1. Any2AnyTryon 의 학습 데이터는 트리플 (target, cond_spa, cond_sub) 각 1장.
+2. 따라서 모델은 "target + 최대 두 조건 슬롯" 패턴만 학습한 상태.
+3. 옷별 role_id = 3, 4, ... 를 새로 주는 학습 신호가 없음.
+4. 코드만 고쳐도 가중치가 무지함 -> 의미 있는 동작이 안 나옴.
+5. 새 데이터 + 재학습이 필요.
+```
+
+이것이 Q5 (multi-item 동시 입히기 미지원) 의 가장 근본적인 구조적 이유입니다.
+
+reference 이미지 자체의 N개 지원 한계는 Q10 참조.
+
+### Q10. 이 연구는 reference 이미지가 여러 개인 경우를 지원하나?
+
+**아닙니다.** 본 논문 전체에서 reference 이미지의 최대 개수는 **2장 (cond_spa 1장 + cond_sub 1장)** 이고, 그 이상이 들어가는 경로 자체가 존재하지 않습니다.
+
+이름이 "any2any" 라 다중 reference 가 가능해 보이지만, 실제로는 **2-into-1 mapping** 의 우아한 사례입니다.
+
+**a. 어디서 이게 확인되는가**
+
+```text
+[1] 학습 데이터셋 스키마
+  jsonl 한 row =
+    target_image            : 1장
+    condition_spatial_image : 1장 (또는 null)
+    condition_subject_image : 1장 (또는 null)
+  -> 가변 N 슬롯 없음
+
+[2] prepare_latent_image_ids 의 시그니처
+  prepare_latent_image_ids(height, width_tgt,
+                            height_spa, width_spa,
+                            height_sub, width_sub, ...)
+  -> spa / sub 각각 단일 (height, width) 한 쌍
+  -> 슬롯이 가변 길이로 늘어나는 인터페이스가 아예 없음
+
+[3] 4가지 태스크별 입력 개수
+  표준 try-on            : cond_spa 1장 + cond_sub 1장
+  garment reconstruction : cond_sub 1장
+  model-free try-on      : cond_sub 1장
+  layered try-on         : cond_spa 1장 + cond_sub 1장
+  -> 어디에도 N장 reference 없음
+
+[4] multi LoRA 도 입력은 1장
+  dev_lora_any2any_multi.safetensors
+  = "한 모델 사진(입력 1장) 에서 여러 옷을 분리해서 출력"
+  -> 출력 쪽이 multi 이지 입력 쪽이 multi 가 아님
+```
+
+**b. 왜 본질적 한계인가**
+
+Any2AnyTryon의 Adaptive Position Embedding은 우아하지만 **"2가지 종류 (spatial / subject) 의 reference 를 1장씩 받는다"** 라는 가정 위에서 우아합니다.
+
+```text
+학습된 구조가 target + 최대 두 조건 슬롯에 맞춰져 있음
+  -> 타겟 / spa / sub 외 다른 의미 슬롯이 없음
+  -> reference 이미지 2개 = 한계
+
+진짜 multi-reference 를 지원하려면 필요한 것:
+  - 가변 길이 N 슬롯을 받는 인터페이스         -> 없음
+  - 옷마다 다른 role_id 학습                  -> 없음
+  - multi-reference 페어 데이터셋             -> 없음
+  - 평가 벤치마크                             -> 없음
+```
+
+**c. multi-reference 가 진짜 필요하면 봐야 할 연구**
+
+```text
+M&M VTO (CVPR 2024)
+  -> 여러 옷 이미지 + 텍스트 layout 묘사
+  -> "어떤 슬롯이 무엇인지" 를 텍스트로 매칭
+
+MuGa-VTON (2025.08)
+  -> GRM / PRM / A-DiT 모듈로 상의 + 하의 jointly model
+  -> mask 기반 multi-garment, DiT 류
+
+OmniGen / OmniGen2
+  -> 가변 multi-reference 를 자연어 + 위치 인덱스로 처리
+
+IP-Adapter Multi-Reference
+  -> 여러 IP-Adapter 가중치를 합성
+
+OminiControl (2024)
+  -> ControlNet 분기를 다중 reference 로 확장
+```
+
+**d. 정리**
+
+```text
+Any2AnyTryon 의 디자인은 "1 spatial + 1 subject" 두 reference 모델이고,
+이게 코드, 데이터, 위치 임베딩, 평가 모든 층에 일관되게 깔려 있다.
+
+장점 : 단순하고 학습이 안정적이며 작은 LoRA 로 통합 처리.
+단점 : 진짜 multi-reference 가 필요한 시나리오
+       (멀티 옷 동시 입히기, 여러 인물 합성, 다중 IP 보존 등) 에는
+       구조적으로 부적합.
+
+이름이 "any2any" 라고 해서 입력 reference 가 가변이라는 뜻이 아니다.
+"target 슬롯이 무엇이든, cond 슬롯이 무엇이든 통합 처리"
+라는 의미의 any2any 다.
+```
+
 ---
 
 ## 16. 한계와 주의점
@@ -942,8 +1233,8 @@ Any2AnyTryon을 가장 짧게 이해하면 다음입니다.
 
 핵심 설계:
   target   = noisy latent, role_id 0
-  cond_spa = clean latent, role_id 1, target과 같은 x 좌표
-  cond_sub = clean latent, role_id 2, target 오른쪽으로 x offset
+  cond_spa = clean latent, 있으면 role_id 1, target과 같은 x 좌표
+  cond_sub = clean latent, 다음 role_id, target 오른쪽으로 x offset
 
 학습:
   조건 이미지는 clean latent로 유지하고,
