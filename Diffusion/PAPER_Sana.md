@@ -443,7 +443,7 @@ Mix-FFN = Inverted Residual Block
 ### 후속 버전
 
 | 버전 | 출시 | 발표 | 핵심 |
-|---|---|---|
+|---|---|---|---|
 | SANA-1.5 | 2025-01 | ICML 2025 | 4.8B 스케일 업, inference scaling |
 | SANA-Sprint | 2025-03 | ICCV 2025 highlight | sCM distillation, **0.1초 1-step** (H100) |
 | SANA-Video | 2025-10 | ICLR 2026 Oral | Block Causal Linear Attention 비디오 |
