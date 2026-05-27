@@ -397,6 +397,64 @@ UniCustom의 결정타는 **이 시간 순서를 깨버린 것**. ViT와 VAE를 
 
 OmniContext 평균에서 UniCustom 7.84 vs GPT-Image-2 9.24, Nano Banana 2 8.92. 약 1.0~1.4 격차 — 주로 **인물 정체성 보존**과 **복잡한 객체 상호작용**에서 뒤짐. 다만 MICo-Bench(멀티 주체 특화)에서는 오픈소스 중 압도적 — 즉 UniCustom의 강점은 **여러 참조의 분리 유지**이고, 격차의 본질은 **단일 정체성의 fidelity** 쪽.
 
+### Q5. Z-Image, FLUX 2와 구조적으로 어떻게 다른가?
+
+> 왜 이 절을 두는가? 비슷한 시기에 나온 동급 오픈/세미오픈 거대 모델과의 자리매김. 같은 "이미지 생성"이지만 셋의 설계 철학이 정반대 방향.
+
+#### 구조 비교 표
+
+| 측면 | **UniCustom** (2026-05) | **Z-Image** (2025-11) | **FLUX 2** (2025-11) |
+|---|---|---|---|
+| **주체** | Kuaishou Kling 추정 | Alibaba Tongyi MAI | Black Forest Labs |
+| **주요 목표** | 멀티 레퍼런스 grounding-binding 해결 | 6B로 20B+ 따라잡기 (효율) | 통합 멀티 레퍼런스 + 편집 |
+| **확산 백본** | LongCat-Image-Edit DiT (재사용) | 6B **Single-Stream DiT** (자체) | Rectified Flow Transformer (자체) |
+| **파라미터 (확산)** | LongCat 크기 (논문 미명시) | **6B** | **약 32B (dev)** |
+| **언어 처리 모듈** | **Qwen2.5-VL (VLM, 얼림)** | **Qwen3-4B (텍스트 only LLM)** | **Mistral-3 24B VLM** |
+| **참조 비전 인코더 (ViT)** | Qwen2.5-VL 내장 ViT | 별도 ViT 없음 | VLM 내장 (Mistral-3 vision) |
+| **참조 외형 인코더 (VAE)** | LongCat VAE (16ch 추정) | LongCat류 VAE | **새로 학습한 VAE** (compression 최적화) |
+| **참조 컨디셔닝 방식** | **Early Fusion** (식 1): ViT+VAE → VLM 전 결합 | 편집은 reference latent를 DiT에 in-context | VLM과 flow transformer 결합 (디테일 미공개) |
+| **두 갈래 분리 여부** | **통합 (한 갈래)** ← 노벨티 | 텍스트만 (참조 비전 미사용) | 두 갈래 추정 |
+| **멀티 레퍼런스 지원** | **특화** (이론 N장 무제한) | 보조 (편집 위주, 1~소수장) | **최대 10장** (명시) |
+| **의미↔외형 binding 강제** | **Slot-wise L_bind MSE** (식 3) | 해당 없음 | 미공개 |
+| **항등 초기화 트릭** | W_fuse = [I; 0] (식 2) | 해당 없음 | 미공개 |
+| **학습 비용** | H200×128 + 36K steps | **314K H800h** (강조점) | 미공개 |
+| **Distillation** | 미공개 | **Decoupled DMD + DMDR** (Turbo 8-step) | 미공개 |
+| **RLHF** | 미공개 | **2-stage RLHF** | 미공개 |
+| **공개 범위** | "코드 곧 공개" | 추론 코드 + 가중치 공개 | API + 가중치 일부 공개 |
+
+#### 한 줄로 자리매김
+
+- **UniCustom** — "**입력 인터페이스를 손본 모델**". 기존 DiT(LongCat)는 그대로, **VLM에 들어가는 참조 토큰의 모양만** 바꿈. 식 (1) 한 줄이 핵심.
+- **Z-Image** — "**전체 파이프라인을 다이어트한 모델**". 참조 이미지 문제는 거의 안 다루고 텍스트→이미지의 효율에만 집중. VLM 없이 Qwen3-4B 텍스트 LLM만, Single-Stream DiT로 파라미터 절약.
+- **FLUX 2** — "**큰 VLM과 큰 flow transformer를 결합한 거인**". Mistral-3 24B VLM + 32B rectified flow transformer. 10장까지 받지만 내부 binding 메커니즘 미공개.
+
+#### 자리매김 도식
+
+```
+                    멀티 레퍼런스 특화
+                          ▲
+                          │
+                    UniCustom (소형 노벨티)
+                          │
+                          │
+   효율 ◄──── Z-Image ─────┼─────── FLUX 2 ────► 스케일
+   (6B)                    │                  (32B + 24B VLM)
+                          │
+                          │
+                    텍스트→이미지 위주
+                          ▼
+```
+
+#### 흥미로운 비교 포인트
+
+1. **VLM 사용 양상이 셋 다 다름**: Z-Image는 텍스트 LLM만, UniCustom은 Qwen2.5-VL을 얼린 채로 입력만 손봄, FLUX 2는 Mistral-3 24B VLM 전체를 무겁게 운영.
+2. **참조 컨디셔닝 철학이 다름**: Z-Image는 "참조는 부차적", UniCustom은 "참조 짝짓기가 모든 것", FLUX 2는 "참조도 많이 받고 잘하자(디테일 비공개)".
+3. **UniCustom의 약점이 곧 다른 두 모델의 강점**: 백본 의존성(LongCat 한정), 단일 정체성 fidelity — Z-Image는 자체 효율 백본으로, FLUX 2는 큰 스케일로 각각 해결.
+
+#### 면책
+
+FLUX 2의 내부 ViT/VAE 처리 디테일과 binding 메커니즘은 [공식 announcement](https://bfl.ai/announcements/flux-2)에만 의존. 공식 기술 보고서가 별도로 있다고 함 — 표의 FLUX 2 일부 행은 미공개·추정. 보고서 확인 후 갱신 필요.
+
 ---
 
 ## 한 줄 요약 (전체)
