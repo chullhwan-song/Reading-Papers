@@ -8,6 +8,7 @@
 
 | No | Title | Venue | Paper | Code | Updated |
 |---|---|---|---|---|---|
+| 12 | [UniRef-Image-Edit: Towards Scalable and Consistent Multi-Reference Image Editing](Diffusion/PAPER_UniRef-Image-Edit.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2602.14186) | - | 2026-05-27 |
 | 11 | [UniCustom: Unified Visual Conditioning for Multi-Reference Image Generation](Diffusion/PAPER_UniCustom.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2605.12088) | - | 2026-05-27 |
 | 10 | [DreamLite: A Lightweight On-Device Unified Model for Image Generation and Editing](Diffusion/PAPER_DreamLite.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2603.28713) | [github](https://github.com/ByteVisionLab/DreamLite) | 2026-05-26 |
 | 9 | [Any2AnyTryon: Leveraging Adaptive Position Embeddings for Versatile Virtual Clothing Tasks](Diffusion/PAPER_Any2AnyTryon.md) | ICCV 2025 | [arxiv](https://arxiv.org/abs/2501.15891) | [github](https://github.com/logn-2024/Any2anyTryon) | 2026-05-27 |
