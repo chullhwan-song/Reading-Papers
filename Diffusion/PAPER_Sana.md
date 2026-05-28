@@ -18,7 +18,8 @@
 | **코드** | [github.com/NVlabs/Sana](https://github.com/NVlabs/Sana) (Apache-2.0) |
 | **자매 논문 (DC-AE)** | [arxiv 2410.10733](https://arxiv.org/abs/2410.10733) — 같은 그룹 같은 날 공개, Sana는 이걸 가져다 사용 |
 | **외부 모델** | Gemma-2-2B-IT (텍스트 인코더, Google 사전학습 그대로) |
-| **외부 데이터** | VLM 캡션 (VILA-3B/13B, InternVL2-8B/26B로 합성) |
+| **외부 데이터** | ~30M 이미지 (저자 Issue #95 답변: **PixArt-α/Σ와 동일** = SAM 11M + JourneyDB 4M + Internal ~15M 추정). Sana 1.5에서 50M로 확장 + 3M curated finetune (CLIP>25). **데이터 출처·공개 여부 모두 비공개** |
+| **캡션 파이프라인** | 이미지당 4개 자동 캡션 생성. **VILA-3B/13B** (NVIDIA, 사내) + **InternVL2-8B/26B** (Shanghai AI Lab). **Qwen-VL 계열은 일절 사용 안 함**. CLIP-Score 기반 동적 샘플링 (CSS) 로 캡션 선택 |
 | **백본 분류** | DiT 본체는 scratch + 텍스트 인코더만 (C) 분기 LLM 재사용 하이브리드. 가장 가까운 비교: PixArt-Σ + Gemma로 갈아끼운 효율 극단화 버전 |
 
 ---
@@ -46,6 +47,10 @@
 
 - **Flow Matching** — 노이즈 → 이미지 경로를 직선화한 학습 방식. SD3·FLUX·Sana 모두 채택.
 - **Flow-DPM-Solver** — Flow Matching 학습 모델에 기존 **DPM-Solver++** (속도 빠른 ODE solver) 를 적응시킨 샘플러. 28~50 step → 14~20 step으로 절반 감소.
+- **Multi-Caption Auto-labelling** — 이미지 한 장당 여러 VLM (vision-language model) 으로 캡션을 자동 생성하는 파이프라인. Sana는 VILA-3B/13B + InternVL2-8B/26B 의 4개 VLM 으로 이미지당 4개 캡션 생성.
+- **CSS (CLIP-Score-based Sampler)** — 각 학습 step 마다 4개 캡션 중 하나를 **CLIP score 기반 확률 분포로 샘플링** (`P(cᵢ) = exp(cᵢ/τ) / Σ exp(cⱼ/τ)`). 온도 τ로 결정성 조절. 캡션 다양성을 보존하면서 품질 가중.
+- **CHI (Complex Human Instruction)** — Glossary 위 "텍스트 조건" 섹션 참조. 데이터 측면에선 Gemma가 대화체로 빠지는 것 (`"Sure! I can describe..."`) 을 막는 강제 정제 prepend.
+- **Cascade Resolution Training** — 저해상도 → 고해상도 순차 학습 (512 → 1024 → 2K → 4K). **256px 사전학습은 스킵** — DC-AE 32× 압축 때문에 256px → 8×8 = 64 토큰만 남아 정보 손실 너무 큼.
 
 ### 평가 지표
 
@@ -412,6 +417,148 @@ Mix-FFN = Inverted Residual Block
 
 → **14~20 step**으로 동일 품질 달성. 구현: [diffusion/model/dpm_solver.py](https://github.com/NVlabs/Sana/blob/main/diffusion/model/dpm_solver.py).
 
+### ⑥ 학습 데이터·파이프라인
+
+**왜?** 모델 구조가 아무리 효율적이어도 학습 데이터·캡션 품질이 나쁘면 화질·instruction following이 무너짐. Sana는 데이터셋 자체를 새로 만들기보다, **PixArt와 같은 이미지 셋에 VLM 자동 캡션 + CLIP-score 샘플링** 으로 캡션 다양성·품질을 끌어올린 케이스. 이 절은 그 파이프라인을 정리.
+
+#### 데이터 규모와 출처
+
+| 항목 | Sana 1.0 | Sana 1.5 | 비고 |
+|---|---|---|---|
+| 사전학습 데이터 | **~30M 이미지** | ~50M 이미지 | 저자 [Issue #95](https://github.com/NVlabs/Sana/issues/95) 답변 ⭐ |
+| Curated finetune | – | **3M** (CLIP > 25 필터링) | GenEval +3%p |
+| 출처 (추정) | **PixArt-α/Σ와 동일** | 50M으로 확장 (출처 비공개) | 저자: "refer to PixArt-alpha and PixArt-Sigma" |
+| **공개 여부** | **❌ 데이터 비공개** | ❌ | 코드·가중치만 공개 |
+
+**PixArt 기준 데이터 구성 (Sana 1.0 추정 = ~30M):**
+
+| 데이터셋 | 규모 | 라이선스 | 출처 |
+|---|---|---|---|
+| **SAM (Segment Anything)** | 11M | Apache-2.0 | Meta 공개 |
+| **SAM-LLaVA caption** | 11M | LLaVA로 재캡션 | 합성 |
+| **JourneyDB** | 4M | 연구용 공개 | Midjourney 생성 이미지 + prompt |
+| **Internal Data** | ~15M | 비공개 | 자체 큐레이션 |
+
+→ 핵심: **데이터 자체는 비공개지만 PixArt 셋업을 따라가면 공개 SAM + JourneyDB로 대부분 재현 가능**. 완전 비공개 모델 (FLUX·SD3) 대비 투명도 높음.
+
+#### Multi-Caption Auto-labelling Pipeline (Sec 3.1)
+
+> *"For each image, whether or not it contains an original prompt, we will use four VLMs to label it: VILA-3B/13B, InternVL2-8B/26B. Multiple VLMs can make the caption more accurate and more diverse."*
+
+**4개 VLM이 이미지당 1개씩 캡션 생성 → 이미지당 4개 캡션 셋:**
+
+| VLM | 개발사 | 라이선스 | 사이즈 |
+|---|---|---|---|
+| **VILA-3B** | **NVIDIA + MIT** | Apache-2.0 (코드), Llama-2 community (가중치) | 3B |
+| **VILA-13B** | NVIDIA + MIT | 동일 | 13B |
+| **InternVL2-8B** | Shanghai AI Lab + SenseTime + Tsinghua | MIT (코드), Apache-2.0 (가중치) | 8B |
+| **InternVL2-26B** | 동일 | 동일 | 26B |
+
+→ **4개 전부 오픈소스.** 누구나 가중치 다운로드해 같은 캡션 셋 재현 가능.
+
+⚠️ **주목: Qwen-VL 계열은 일절 안 씀** (캡션·텍스트 인코더·백본 어디에도). 이유 추정:
+1. NVIDIA 사내 (VILA) 우선
+2. 당시 (2024-10) InternVL2가 오픈 SOTA로 검증됨 (GPT-4V 근접)
+3. Qwen2-VL은 비슷한 시점 (2024-09) 출시로 검증 부족
+4. 영어 중심 학습이라 Qwen의 중국어 강점 불필요
+
+#### CLIP-Score-based Sampler (CSS)
+
+**왜?** 4개 캡션 중 어떤 걸 학습에 쓸지가 매번 문제. 단순히 random 선택하면 품질 낮은 캡션도 동등하게 쓰이고, 항상 최고만 쓰면 다양성 손실.
+
+**확률 분포:**
+```
+P(c_i) =  exp(c_i / τ)
+          ─────────────
+          Σⱼ exp(c_j / τ)
+```
+
+- `c_i` = i번째 캡션의 **CLIP score** (이미지와의 정합도)
+- `τ` (온도, temperature):
+  - `τ → 0`: 가장 높은 CLIP score만 결정적 선택
+  - `τ → ∞`: 4개 중 균등 무작위
+  - **Sana는 중간값으로 품질-다양성 균형**
+
+**효과 (논문 Table 4):**
+
+| 캡션 전략 | FID ↓ | CLIP ↑ |
+|---|---|---|
+| Single caption | 6.13 | 27.10 |
+| **Multi-caption + CSS** | **6.12** | **27.26** (+0.16) |
+
+→ FID는 거의 동일하지만 CLIP 정합도가 향상. 캡션 다양성으로 일반화 능력 ↑.
+
+#### Cascade Resolution Training
+
+```
+512px (메인 사전학습)  →  1024px (finetune)  →  2K  →  4K
+       ↑
+       ⚠️ 256px 사전학습은 스킵
+       이유: DC-AE 32× 압축이면 256px → 8×8 = 64 토큰밖에 안 남음
+            → 정보 손실 너무 큼 ("256 resolution loses too much information")
+```
+
+→ PixArt-Σ 등 기존 모델은 256px부터 출발하지만, Sana는 **DC-AE 압축률이 커서 512부터 시작**. 이게 다른 모델과의 큰 디자인 차이.
+
+#### CHI (Complex Human Instruction) — 데이터 측면
+
+CHI는 알고리즘 ④ 에서 모델 측면을 다뤘지만, **데이터 관점**에서 보면:
+
+> *"without CHI, although Gemma-2 can understand the meaning of the input, the output is conversational"*
+
+→ CHI 없을 때 Gemma의 응답: `"Sure! I can describe..."` 처럼 **대화체 (chat-style)** 로 빠짐. 이미지 생성에 부적합.
+
+**CHI prepend로 정제:**
+- 52K step: GenEval 45.5 → 47.7 (+2.2)
+- 140K + 5K finetune: 52.8 → 54.8 (+2.0)
+
+#### 다국어 데이터 (Sana 1.5에서 추가 공개)
+
+| 구성 | 규모 |
+|---|---|
+| 영어 원본 | 50M (사전학습) |
+| **다국어 추가** | **100K 영어 prompt → GPT-4로 번역** |
+| 번역 방향 | 순 중국어 / 영중 혼합 / 이모지 포함 |
+
+→ 영어 데이터로만 학습했음에도 **zero-shot 중국어·이모지 생성 가능** 한 이유: Gemma-2의 다국어 사전학습 + 100K 다국어 finetune.
+
+#### 학습 step·GPU 통계 (확인된 범위)
+
+| 항목 | Sana-0.6B (1024px stage) | Sana-1.6B |
+|---|---|---|
+| iteration | 52,000 | 140K + 5K (CHI finetune) |
+| batch size | 128 | 미공개 |
+| GPU | **32 장** (A100/H100 미공개) | 미공개 |
+| 처리 샘플 | ~213M (52K × 128 × 32) | 미공개 |
+| 30M 기준 epoch | ~7 epoch | 미공개 |
+| **총 GPU hours** | **❌ 미공개** | **❌ 미공개** |
+
+→ Z-Image (314K H800h 공개) 같은 투명한 보고는 안 함. NVIDIA·BFL·Stability 등 대부분 모델의 관행.
+
+#### 비공개 항목
+
+| 항목 | 상태 |
+|---|---|
+| 데이터셋 정확 출처·라이선스 | ❌ |
+| 해상도·aspect ratio 분포 | ❌ |
+| 미적 점수 (aesthetic) 컷오프 | ❌ |
+| 합성 데이터 비율 | ❌ |
+| 데이터 augmentation | ❌ (논문 미언급) |
+| 캡션 평균 길이·토큰 통계 | ❌ |
+| GPU 종류·총 hours·금전 비용 | ❌ |
+
+#### 정리: 데이터 측면의 핵심 기여
+
+**Sana의 데이터적 기여는 "큰 데이터 모았다" 가 아님.** 정확히는:
+
+1. **PixArt와 동일한 ~30M 이미지** 를 그대로 활용
+2. **4개 오픈소스 VLM (VILA + InternVL2)** 으로 캡션 다양성 자동 생성
+3. **CLIP-score 샘플링 (CSS)** 으로 품질-다양성 균형
+4. **CHI prompt** 로 Gemma 출력을 강제 정제
+5. **256 스킵 cascade** 로 DC-AE 압축과 정합
+
+→ **데이터 큐레이션 자체보다 캡션 품질·다양성** 으로 작은 모델의 성능을 끌어올림.
+
 ---
 
 ## 📊 실험 요약
@@ -672,7 +819,53 @@ Out_i = Σⱼ ReLU(Q_i)ᵀ · ReLU(K_j) · V_j
 
 → "PixArt-Σ 계열의 효율 극단화 + (C) 분기 LLM 텍스트 인코더 도입" 의 하이브리드.
 
-### Q9. 왜 0.6B/1.6B로 작게 만들었나? 더 키우면 안 되나?
+### Q9. 학습 데이터 출처와 규모는?
+
+→ 자세한 구성·통계는 **⑥ 학습 데이터·파이프라인** 섹션 참조. 핵심만:
+
+| 질문 | 답 |
+|---|---|
+| 규모 | **~30M (Sana 1.0)** → 50M (Sana 1.5) → 3M curated finetune (Sana 1.5) |
+| 출처 | 저자 [Issue #95](https://github.com/NVlabs/Sana/issues/95) 답변: **"refer to PixArt-alpha and PixArt-Sigma"** = SAM 11M + JourneyDB 4M + Internal ~15M |
+| 공개? | ❌ 데이터셋 비공개 (코드·가중치만 공개) |
+| 그러나... | PixArt 셋업 기준 **공개 SAM + JourneyDB로 대부분 재현 가능** |
+| 캡션 | 이미지당 **4개** (VILA-3B/13B + InternVL2-8B/26B 각 1개씩) |
+| 캡션 선택 | **CSS** (CLIP-score 기반 확률 샘플링) |
+| 다국어 (1.5) | 영어 100K prompt → GPT-4 번역 (중국어/영중/이모지) |
+| 해상도 cascade | 512 → 1024 → 2K → 4K (**256은 스킵**, DC-AE 32× 압축 때문) |
+| GPU hours | ❌ 미공개 |
+
+### Q10. 캡션 생성 VLM 4개는 오픈소스? Qwen-VL은 왜 안 썼나?
+
+**4개 모두 완전 오픈소스 — 누구나 재현 가능.**
+
+| 모델 | 개발사 | 라이선스 | 가중치 |
+|---|---|---|---|
+| VILA-3B / 13B | **NVIDIA + MIT** | Apache-2.0 (코드) / Llama-2 community (가중치) | [github.com/NVlabs/VILA](https://github.com/NVlabs/VILA) |
+| InternVL2-8B / 26B | Shanghai AI Lab + SenseTime | MIT (코드) / Apache-2.0 (가중치) | [github.com/OpenGVLab/InternVL](https://github.com/OpenGVLab/InternVL) |
+
+**Qwen-VL 미사용 — 추정 이유:**
+
+| 이유 | 설명 |
+|---|---|
+| NVIDIA 사내 우선 | VILA가 NVlabs 자체 VLM. "우리 거 먼저" |
+| 검증된 SOTA 선택 | 2024-10 시점 InternVL2-26B가 오픈 SOTA (GPT-4V 근접) |
+| 타이밍 | Qwen2-VL은 2024-09 신상 — 검증 부족 |
+| 도메인 | 영어 중심 학습, Qwen의 중국어 강점 불필요 |
+
+**다른 동시대 모델과 비교:**
+
+| 모델 | Qwen 사용? | 어디에? |
+|---|---|---|
+| **Sana** | **❌** | 캡션·텍스트 인코더·백본 모두 미사용 |
+| Qwen-Image (Alibaba) | ✅ | 백본 Qwen2.5-VL-7B |
+| HiDream-O1 | ✅ | 백본 Qwen3-VL-8B |
+| Z-Image | ✅ | 텍스트 인코더 Qwen3-4B |
+| Janus-Pro (DeepSeek) | ❌ | DeepSeek-LLM + SigLIP |
+
+→ Sana는 **Qwen 계열을 어디에도 안 쓴** 모델. NVIDIA 입장에서 VILA가 계속 발전 중이라 외부 모델로 바꿀 유인 없음. 후속작 (1.5/Sprint/Video) 에서도 같은 VLM 셋 유지.
+
+### Q11. 왜 0.6B/1.6B로 작게 만들었나? 더 키우면 안 되나?
 
 **Sana의 설계 철학은 "SOTA보다 효율".** 소형 모델로 4K를 빠르게가 목표.
 
