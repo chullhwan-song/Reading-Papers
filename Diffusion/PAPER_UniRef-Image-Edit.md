@@ -256,6 +256,171 @@ t=1이면 깨끗, t=0이면 순수 노이즈. 직선 보간.
 
 ---
 
+### 7. 데이터 합성의 본질 — 왜 정답을 "새로 그려야" 했는가
+
+> 왜 이 절을 두는가? §6의 4단계가 "무엇을 했는지"라면, 이 절은 **"왜 그렇게 할 수밖에 없었는지"** 와 **"그래서 이 모델의 본질이 무엇인지"** 를 다룹니다. 학습 supervision 구조를 이해하는 게 이 논문 전체를 한 단계 깊이 보는 열쇠입니다.
+
+#### 7.1 학습 supervision의 퍼즐 — 모델 인물 = 타겟 인물
+
+멀티 레퍼런스 편집 모델을 학습시키려면 다음 형태의 페어가 필요합니다.
+
+```
+입력:  [텍스트 명령]  +  [참조 1: 인물 A의 사진]  +  [참조 2: 옷 X의 사진]
+정답:  인물 A 가 옷 X 를 입고 있는 사진
+```
+
+여기서 **정답의 인물은 참조 1의 인물 A와 동일 인물**이어야만 합니다. 그렇지 않으면 픽셀 손실(식 4)이 모델에게 잘못된 신호를 줘요.
+
+| 만약 정답 인물 ≠ 참조 인물이면? | 모델이 학습하는 것 |
+|---|---|
+| 정답에 다른 사람이 그려져 있음 | "참조 인물의 ID는 무시해도 된다" |
+| 정답의 옷이 참조 옷과 다름 | "참조 옷의 외형은 안 따라가도 된다" |
+| 둘 다 다름 | 학습 자체가 노이즈 |
+
+즉 supervision이 의미를 가지려면 **(참조의 모든 시각 요소) = (정답에 보존된 요소)** 라는 등식이 데이터 레벨에서 강제돼야 합니다.
+
+#### 7.2 자연 데이터의 한계
+
+세상에 흔히 있는 사진 데이터는:
+- 단일 인물의 단일 옷 사진 (대부분의 인스타그램·VITON 이미지)
+- 또는 옷 단독 사진 (쇼핑몰 상품 사진)
+
+그런데 학습에 필요한 건:
+- **같은 인물**의 **다른 옷·다른 포즈** 사진들이 **페어로 묶인 것**
+
+이런 데이터를 자연 상태로 모으는 건 비현실적이에요. 같은 모델을 다른 옷으로 다시 촬영해야 하는데, 비용·동의·다양성 면에서 모두 막힘.
+
+VITON-HD가 일부 해결책이지만 (한 인물 + 그 사람이 입은 옷 단독 페어), 이건 "옷 한 종류"만 가능한 단일-방향 페어이고, 본 논문이 노리는 "A 인물 + B 옷 + C 물체" 같은 **다중 제약 페어**는 못 만듭니다.
+
+#### 7.3 본 논문의 해법 — "상용 모델한테 정답을 그리게 시키기"
+
+이 데이터 부재를 깨는 게 §3.4의 Synthesis 단계입니다. 논문 원문 그대로:
+
+> *"To obtain high-fidelity ground-truth target images, we adopt a task-specific synthesis strategy utilizing **state-of-the-art proprietary models**. (1) For HOI: We employ **Nano Banana Pro**... (2) For Multi-Person: We employ **Seedream 4.0**... This **distillation** process effectively transfers the capabilities of these SOTA closed-source models into the UniRef-Image-Edit framework."*
+
+데이터 흐름을 그리면:
+
+```
+[Collection]   실세계 인물 사진 A + 옷 단독 사진 B + 물체 단독 사진 C
+                         │
+                         ▼
+[Annotation]   GPT-5 가 다중 제약 프롬프트 생성:
+                "A 의 인물이 B 의 재킷을 입고 C 의 기타를 든 장면"
+                         │
+                         ▼
+[Synthesis]    Nano Banana Pro / Seedream 4.0 가
+                위 프롬프트를 받아 정답 이미지를 합성
+                  ───────────────────────────
+                  이때 합성된 정답은:
+                  • 인물 ID = A 와 동일 (보존)
+                  • 옷 외형 = B 와 동일 (전이)
+                  • 물체 외형 = C 와 동일 (전이)
+                  • 셋이 자연스럽게 합쳐진 한 장면
+                         │
+                         ▼
+[Training Pair]  입력 = (A, B, C, 프롬프트) / 정답 = 합성된 한 장
+```
+
+즉 **"멀티 레퍼런스 정답을 갖춘 페어"** 가 자연 상태에는 없으니, 그걸 잘 그리는 상용 모델 둘이 대신 그려주게 한 것입니다.
+
+#### 7.4 이 작업의 본질을 한 줄로
+
+> **UniRef-Image-Edit = Nano Banana Pro + Seedream 4.0 의 멀티 레퍼런스 합성 능력을, Qwen-Image-Edit 백본으로 distillation한 작업.**
+
+여기서 distillation(증류)의 의미는 일반적인 모델 distillation과 약간 다릅니다:
+
+| 일반 distillation | 본 논문의 데이터 distillation |
+|---|---|
+| Teacher의 **logit/feature** 를 student가 흉내 | Teacher 모델의 **결과물(이미지)** 자체를 정답으로 학습 |
+| Teacher 가중치 접근 필요 | **API 로 결과 이미지만 받아도 됨** (블랙박스) |
+| 손실: KL on logits | 손실: **MSE on velocity (식 4)** |
+| 한계: teacher 구조에 student가 묶임 | 한계: teacher 결과의 품질 상한에 student가 묶임 |
+
+API만 있어도 되는 두 번째 형태가 강력한 점은 **폐쇄 SOTA에 대한 오픈소스 따라잡기의 표준 무기**가 됐다는 것입니다. 본 논문 외에도 [[paper_dreamlite]] (ByteDance, Seedream 증류) 같은 사례가 같은 패턴.
+
+#### 7.5 §1 Introduction의 동기와 정확히 맞물림
+
+논문 §1 첫 단락:
+> *"While proprietary and open-source models such as Nano Banana, Seedream 4.0, and Qwen-Image-Edit-2511 have demonstrated impressive capabilities... the specific methodologies used to train them for complex multi-image fusion tasks **remain undisclosed**. This **lack of transparency** creates a significant barrier for the research community."*
+
+즉 문제 진단이 "방법은 비공개"였고, 처방이 "**방법은 모르겠지만 결과물은 API로 뽑을 수 있으니, 결과물을 정답으로 써서 따라잡자**". 동기와 해법이 매끄럽게 이어지는 구조.
+
+#### 7.6 이 구성이 만드는 세 가지 한계
+
+| 한계 | 설명 | 본 논문의 대응 |
+|---|---|---|
+| **품질 상한선 = 상용 모델 수준** | Nano Banana Pro가 못 보존하는 디테일(특정 흉터, 비주류 인종 특징, 정밀 색조)은 UniRef-Image-Edit도 못 함 | 직접 대응 없음 — 구조적 상한 |
+| **합성 ID 미세 흔들림** | Nano Banana 가 합성한 "정답" 자체가 인물 A의 ID를 미세하게 흘려도 모델은 이를 정답으로 배움 | **MSGRPO 의 Feature Consistency 보상축**으로 RL 단계에서 한 번 더 잡음 (§3.3) |
+| **편향 상속** | 상용 모델의 인종·체형·문화 편향이 그대로 student로 이식 | reward 데이터 공개 + open-source 정책으로 검증 가능성만 확보 |
+
+두 번째 한계가 MSGRPO의 존재 이유 중 하나라는 점이 재미있습니다 — **SFT 데이터 자체가 완벽하지 않다는 것을 논문이 암묵적으로 인정**하고, 그래서 RL로 후처리를 거는 셈입니다.
+
+#### 7.7 Figure 3(a) 그림 다시 읽기
+
+이 절을 읽고 Figure 3(a) 의 입력 구성을 다시 보면:
+
+- Target Image (어두운 카디건 입은 인물) ← **Nano Banana Pro 가 합성한 이미지**
+- Input Image ② (꽃무늬 입은 같은 인물) ← **실세계 사진 A** (VITON-HD 또는 Qwen-Image 합성)
+- Input Image ① (어두운 카디건 단독) ← **실세계 옷 사진 B** (Subjects200K)
+
+즉 ②의 인물과 Target의 인물은 **같은 ID**이며, Target은 Nano Banana Pro가 "②의 인물에게 ①의 옷을 입혔다면 이렇게 생겼을 것"을 그려준 결과. 그림이 보여주는 시각적 차이(옷·포즈)는 합성으로 만들어진 차이입니다.
+
+#### 7.8 영역 외 불변성(off-region invariance) — 모델이 슬쩍 바꿔버릴 위험
+
+> 왜 이 절을 두는가? 7.1~7.3이 "인물 ID가 같아야 한다"는 거시적 제약이었다면, 이 절은 한 단계 더 엄격한 **픽셀 단위 제약** — "옷 영역 외에는 신발·모자·포즈·배경까지 전부 동일해야 한다" — 을 다룹니다. 이것이 합성 데이터로는 보장되지 않는 지점입니다.
+
+##### 이상적인 try-on supervision의 정의
+
+"모델 A + 옷 B → 옷 B 입은 사람 C 생성"을 학습할 때, 엄밀히는:
+
+```
+입력:  모델 A (옷 X + 신발 S + 모자 H + 얼굴 F + 포즈 P + 배경 BG)
+       + 옷 B (단독 사진)
+
+정답 C =  ( 얼굴 F, 신발 S, 모자 H, 포즈 P, 배경 BG 는 그대로 )
+          + ( 옷 X → 옷 B 로 교체된 영역만 다름 )
+```
+
+즉 **옷 B 영역 외 모든 픽셀이 A와 동일**해야 함. 안 그러면 모델은 "옷이 바뀌면 신발·포즈·조명도 같이 바뀌어도 된다"고 잘못 배웁니다.
+
+##### 세 가지 데이터 경우와 invariance 보장 수준
+
+| 경우 | 입력/정답 구성 | 영역 외 invariance | 보장 주체 |
+|---|---|---|---|
+| **1. 마스크 기반 try-on** (VITON-HD) | 옷 영역만 마스크된 인물 + 옷 단독 → 마스크 없는 원본 | ✅ **픽셀 단위** | 데이터 자체 (마스크 외는 원본 복사) |
+| **2. 마스크-free instruction** (UniRef-Image-Edit 채택) | 인물 + 옷 + 텍스트 → **Nano Banana 합성 정답** | ⚠️ **합성 모델 양심에 의존** | 없음 (Nano Banana가 보존해주길 기대) |
+| **3. 멀티 합성** (A인물+B옷+C배경) | 셋 → 새 장면 | 느슨함 (배경도 바뀜이 정답) | ID·외형만 보존 |
+
+##### 경우 2의 핵심 위험
+
+UniRef-Image-Edit이 채택한 마스크-free 방식에서는, Nano Banana Pro가 정답을 그릴 때 **옷 영역만 정확히 바꾸고 나머지를 픽셀 단위로 복사하리란 보장이 없습니다.** 옷을 갈아입히면서:
+- 신발이 슬쩍 다른 모델로 바뀌거나
+- 머리카락 가닥·포즈가 미세하게 달라지거나
+- 배경 조명이 변하거나
+
+이런 "부수적 변화(incidental change)"가 정답에 섞입니다. 그 결과 모델이 학습하는 것은:
+- ❌ "옷 외 모든 것은 동일하다" (원하던 것)
+- ✅ "옷이 바뀌면 신발·포즈·조명도 약간 따라 바뀌어도 된다" (실제 학습되는 것)
+
+미세하지만 누적되면, 사용자가 "신발은 그대로, 옷만" 원할 때 모델이 신발도 슬쩍 바꾸는 경향을 띱니다.
+
+##### 본 논문의 대응과 그 한계
+
+| 대응 축 | 방식 | 한계 |
+|---|---|---|
+| **데이터** | VITON-HD(경우 1, 픽셀 페어) 를 일부 혼합 | 합성 1M vs 공개 0.8M 중 일부만 VITON-HD → 합성 데이터 영향이 우세 |
+| **RL (MSGRPO)** | Feature Consistency 보상으로 ID·기하 보존 체크 | **ID 수준만 평가** — 신발·모자·배경의 픽셀 단위 invariance는 보상 축에 **없음** → 슬쩍 바꿔도 패널티 없음 |
+| **아키텍처** | 없음 (마스크 같은 명시적 영역 제약 미도입) | 마스크-free 유연성을 얻은 대가로 invariance 보장을 잃음 |
+
+##### 정리
+
+- "옷 영역만 다르고 모두 같아야 한다"는 제약은 **이상적 try-on supervision의 정의 그 자체**
+- VITON-HD 류는 이를 **데이터로 강제**, UniRef-Image-Edit의 합성 데이터는 **Nano Banana의 양심에 의존**
+- 결과적으로 **마스크-free 유연성을 얻은 대신, 옷 외 영역의 픽셀 단위 invariance는 학습에서 보장되지 않음**
+- 본 논문이 직접 다루지 않는 **암묵적 한계**. [[paper_any2anytryon]] 가 mask-free VTON에서 clean latent offset으로 이 영역 보존을 다룬 것과 대조하면 처방 부재가 드러남
+
+---
+
 ## 실험 요약
 
 ### 학습 디테일
