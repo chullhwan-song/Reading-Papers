@@ -77,6 +77,44 @@
 
 *왜 이 절을 두나: 이 논문의 정체성이 여기 다 들어 있다. 전작과의 가장 큰 차이가 "텍스트를 어떻게 섞느냐" 한 가지이기 때문.*
 
+### 4.0 전체 그림 한 장 (Figure 2)
+
+*왜 이 절을 두나: 세부로 들어가기 전, 논문이 직접 그린 파이프라인 지도를 먼저 머리에 넣으면 4~8장이 이 그림의 부분 확대로 읽힌다.*
+
+![Figure 2 — Overview of Lumina-Image 2.0](https://arxiv.org/html/2503.21758v1/x2.png)
+
+> **캡션 원문:** "Overview of Lumina-Image 2.0, which consists of Unified Captioner and Unified Next-DiT. The Unified Captioner re-captions web-crawled and synthetic images to construct hierarchical text-image pairs, which are then used to optimize Unified Next-DiT with our efficient training strategy."
+
+그림은 좌우 두 덩어리와 그 사이 데이터 흐름으로 읽으면 됩니다.
+
+```
+[웹 크롤 + 합성 이미지]
+        │
+        ▼
+   ┌──────────────────────────┐
+   │  Unified Captioner (UniCap)│   ← 왼쪽: 데이터를 만드는 쪽 (6장)
+   │  한 이미지 → 긴/중간/짧은 캡션 │
+   │         + 다관점 + 다국어     │
+   └──────────────────────────┘
+        │  계층적(hierarchical) image-text 쌍
+        ▼
+   다단계 점진 학습 (256² → 1024²)   ← 가운데: 학습 전략 (7장)
+        │
+        ▼
+   ┌───────────────────────────────────────┐
+   │  Unified Next-DiT                       │   ← 오른쪽: 모델 (4장)
+   │  [텍스트 임베딩 + noisy latent] → concat │
+   │  → joint self-attention + mRoPE         │
+   │  → velocity 예측                         │
+   └───────────────────────────────────────┘
+```
+
+- **왼쪽(UniCap):** 웹·합성 이미지를 다시 캡션해 길이·관점·언어가 다른 고품질 쌍을 만든다 → 6장.
+- **가운데(데이터→학습):** 이 계층적 쌍이 다단계 점진 학습(256→1024)으로 흘러 모델을 최적화한다 → 7장.
+- **오른쪽(Unified Next-DiT):** 텍스트 임베딩과 noisy latent 를 concat 해 joint self-attention + mRoPE 로 처리한다 → 4장.
+
+한마디로 **"좋은 캡션으로 좋은 데이터를 만들어(왼쪽), 통합 DiT 를 효율적으로 학습한다(오른쪽)"** 는 논문 전체를 한 장에 압축한 지도다. "캡션 품질이 곧 수렴·생성 충실도를 좌우한다"는 핵심 주장이 이 그림의 메시지.
+
 ### 4.1 가장 큰 변화 — cross-attention 분리 → joint self-attention
 
 전작 Next-DiT 는 한 레이어 안에서 **셀프 어텐션(이미지끼리)** 과 **크로스 어텐션(이미지→텍스트)** 을 *분리*해 두고, 텍스트 영향은 `gate.tanh()` 의 zero-init 으로 천천히 켰습니다 ([Lumina-Next.md 4.4절](PAPER_Lumina-Next.md)).
