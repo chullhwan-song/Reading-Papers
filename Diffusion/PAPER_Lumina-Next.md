@@ -105,6 +105,52 @@
 
 ## 3️⃣ 주요 알고리즘 설명
 
+### 3.0 Figure 2 — Flag-DiT vs Next-DiT 한눈에 비교
+
+> **왜 이 그림을 먼저 보나:** 이후 §3.1 ~ §3.4 가 모두 *이 블록 다이어그램 위의 어느 위치를 바꿨는가* 의 이야기. 좌(Flag-DiT) ↔ 우(Next-DiT) 의 차이를 한 장에서 짚어두면 후속 식·코드 매핑이 훨씬 명확해진다.
+
+<p align="center">
+  <img src="figures/lumina_next_fig2.png" alt="Lumina-Next Figure 2 — Flag-DiT vs Next-DiT architecture" width="900"/>
+</p>
+
+> **Figure 2 (논문 원문 caption):** *Architecture details of Flag-DiT and Next-DiT. The main improvements of Next-DiT include 3D RoPE, sandwich normalization, group-query attention, etc.*
+
+#### 그림 구성 요약
+
+- **좌측 (Flag-DiT, 전작):** Lumina-T2X 가 쓰던 블록.
+- **우측 (Next-DiT, 본 논문):** Lumina-Next 가 새로 도입한 블록.
+- **공통 외곽:** Noisy input → Patch Embed → N× block → Prediction head → (Predicted Velocity *or* Predicted Noise).
+- **조건 입력 (왼쪽 막대):** Time Embedding + Label Embedding (또는 Caption Embedding) → Proj → 각 블록의 AdaLN modulation 으로 분기.
+
+#### 좌↔우 다른 7가지 (위에서 아래로)
+
+| 위치 | Flag-DiT (좌) | Next-DiT (우) | 어디서 자세히 |
+|---|---|---|---|
+| **Input 영역의 특수 토큰** | `[Next-line token]` 학습 가능 토큰을 *시퀀스에 끼워넣음* | **제거됨** — 좌표가 RoPE 에 직접 인코딩 | §3.2 |
+| **Attention 직전 정규화** | RMS *한 번* (pre-only) | **RMS pre + RMS post 한 쌍** (Sandwich) | §3.1 |
+| **AdaLN modulation 출력** | scale **& shift** (2 종류) | **scale 만** (1 종류) — 단순화 | §3.1 |
+| **RoPE 종류** | 1D RoPE (raster flatten) | **2D RoPE** (h, w 축 분리; 비디오는 3D) | §3.2, 코드는 2D |
+| **Gate** | scale 만 (clip 없음) | **tanh(scale) gate** — ±1 압축 | §3.1 |
+| **MLP 직전·직후 정규화** | RMS pre-only + scale & shift | **RMS pre + RMS post + scale + tanh gate** | §3.1 |
+| **Attention 종류 (그림엔 미명시, 본문 명시)** | MHA | **Grouped-Query Attention** (32→8 KV) | §3.1 |
+
+#### 가장 눈에 띄게 다른 두 곳
+
+1. **블록 안 RMS 박스가 *두 배* 로 늘었다** (Sandwich) — Flag-DiT 는 attention/MLP 각각 RMS 한 번씩, Next-DiT 는 *앞뒤로 한 쌍씩* 총 4 회. 활성값 폭주 차단 (Fig. 4 가 효과 검증).
+2. **AdaLN modulation 의 출력 종류가 줄었다** — Flag-DiT 는 `scale & shift` 두 값, Next-DiT 는 `scale` 만. 대신 *gate 위치에 tanh* 가 새로 들어옴. 즉, *modulation 파라미터를 줄이고 더 부드럽게 만든* 디자인.
+
+#### 그림에 *표시되지 않은* 변경 (본문에서 강조)
+
+- **[nextframe] 학습 가능 토큰 제거** (그림은 [nextline] 만 보여줌).
+- **Long-skip connection 제거** — 두 그림 모두 표시 안 됨이지만 본문에서 "U-DiT 류의 long-skip 은 *오히려 불안정* 하므로 안 씀" 명시.
+- **GQA (Grouped-Query Attention)** — QKV Proj 박스가 그림상 동일하게 보이지만, 본문과 코드 (model.py:172-185) 에서 KV head 가 1/4 로 축소된다고 명시.
+
+#### 한 줄 요약
+
+> **Figure 2 = "Sandwich Norm + tanh Gate + 2D RoPE + 학습 가능 토큰 제거"** 의 네 변화를 한 도식에 모두 표시. 이후 §3.1~§3.4 는 이 그림의 *어느 한 블록* 을 자세히 푸는 구조.
+
+---
+
 ### 3.1 Next-DiT 블록 — Sandwich Norm + tanh-gated AdaLN
 
 **문제 (Flag-DiT 의 표준 DiT 블록)**:
