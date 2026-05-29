@@ -274,7 +274,7 @@ Lumina-Next 수치는 [Lumina-Next.md 4.7절](PAPER_Lumina-Next.md), Lumina-Imag
 | dim | 2304 | 2304 | 3840 | 미공개 |
 | heads / kv | 32 / 8 | 24 / 8 | 32 / 8 | 미공개 |
 | head_dim | 72 | 96 | 128 | 미공개 |
-| **텍스트 결합** | cross-attn 분리 | concat → joint self-attn | concat → joint self-attn | dual(cross-attn)→concat single |
+| **텍스트 결합** | cross-attn 분리 | concat → joint self-attn (가중치 공유) | concat → joint self-attn (가중치 공유) | dual(가중치 분리, **joint self-attn**)→single |
 | **RoPE** | **2D** (h, w) | **3D** [32,32,32] 균등 | **3D** [32,48,48] 공간 가중 | RoPE (축 미공개) |
 | patch | 2 | 2 | 2 | 미공개 |
 | Norm | Sandwich + QK-Norm + tanh-gate | 동일 | 동일 | 미공개 |
@@ -299,7 +299,7 @@ Lumina-Next(1.7B): cross-attn 분리 — 위 두 진영 어디도 아닌 옛 방
 
 - **Next → 2.0 = 구조 혁신** (cross-attn → joint self-attn, refiner 도입, 2D→3D RoPE, 4→16ch VAE).
 - **2.0 → Z-Image = 스케일·파이프라인 강화** (층·폭 키우고, RoPE 를 공간에 더 배분, 네트워크 밖에서 증류·RLHF 추가).
-- **2.0/Z-Image ↔ FLUX.2 = 진영 자체가 다름.** 2.0·Z 는 처음부터 끝까지 텍스트·이미지를 한 줄로 합치는 pure single-stream. FLUX.2 는 앞쪽 dual-stream(텍스트·이미지 전용 가중치 분리)→뒤쪽 single-stream 으로 가는 FLUX.1 계보(= [Z-Image.md 6.2절](PAPER_Z-Image.md)의 dual-stream 진영). 텍스트 인코더도 2~4B LLM 이 아니라 24B VLM.
+- **2.0/Z-Image ↔ FLUX.2 = 진영 자체가 다름.** 단, 차이는 *attention 종류*가 아니라 *가중치 공유 여부*다. **single-stream(2.0·Z)도 dual-stream/MM-DiT(FLUX.2)도 attention 은 둘 다 concat 후 joint self-attention** 이다. 차이는 텍스트·이미지가 **같은 가중치**를 쓰느냐(single) vs **모달리티별 분리 가중치**(own QKV/MLP/AdaLN)를 쓰느냐(dual). FLUX.2 는 앞쪽 dual-stream 블록(분리 가중치) → 뒤쪽 single-stream 블록(공유)으로 가는 FLUX.1 계보(= [Z-Image.md 6.2절](PAPER_Z-Image.md)의 dual-stream 진영). 텍스트 인코더도 2~4B LLM 이 아니라 24B VLM. ※ **진짜 cross-attention(이미지 Q → 텍스트 K/V 비대칭)을 쓰는 건 이 비교에서 Lumina-Next 뿐**이다.
 - 결론: **블록 토폴로지(noise/context refiner → concat → joint backbone)는 2.0 과 Z-Image 가 동일**. 다른 건 체급·RoPE 배분·후처리뿐. FLUX.2 는 표제만 "통합 효율 모델"이고 구조 계열이 다르다.
 
 ---
@@ -333,7 +333,7 @@ Lumina-Next(1.7B): cross-attn 분리 — 위 두 진영 어디도 아닌 옛 방
 실제 비율은 6.15B / 2.6B ≈ 2.4배. 계산한 3.2배보다 작은 건 Z-Image 가 GQA 로 attention 을 일부 아끼고 FFN 비율·refiner 구성이 달라서지만, **차이의 대부분은 층 수(+15%)가 아니라 폭(2304→3840, +67%, 제곱이라 블록당 ≈2.8배)에서 온다.** (이 비교는 DiT 백본만 센 것 — 텍스트 인코더·VAE 는 외부·동결이라 제외.)
 
 ### Q7. 같은 시기 FLUX.2 와는 구조가 같나?
-**다른 계열이다.** 2.0·Z-Image 는 처음부터 끝까지 텍스트·이미지를 한 줄로 합치는 **pure single-stream**. FLUX.2 는 앞쪽 **dual-stream**(텍스트·이미지 전용 가중치 분리 + cross-attention) → 뒤쪽 **single-stream** 으로 가는 FLUX.1 계보다. 텍스트 인코더도 24B VLM(Mistral-3), 체급 32B 로 약 5~12배 크다. → 11장 표 참고.
+**다른 계열이다 — 단 차이는 attention 종류가 아니라 가중치 공유 여부.** 2.0·Z-Image 는 텍스트·이미지가 **같은 가중치**를 쓰는 **pure single-stream**, FLUX.2 는 앞쪽이 **모달리티별 분리 가중치(own QKV/MLP/AdaLN)** 인 **dual-stream 블록** → 뒤쪽 single-stream 으로 가는 FLUX.1/MM-DiT 계보다. **둘 다 attention 자체는 concat 후 joint self-attention 이고 cross-attention 이 아니다** (진짜 cross-attn 은 Lumina-Next 뿐). 텍스트 인코더도 24B VLM(Mistral-3), 체급 32B 로 약 5~12배 크다. → 11장 표 참고.
 
 ---
 
