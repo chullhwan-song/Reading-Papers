@@ -8,6 +8,7 @@
 
 | No | Title | Venue | Paper | Code | Updated |
 |---|---|---|---|---|---|
+| 16 | [PiD: Fast and High-Resolution Latent Decoding with Pixel Diffusion](Diffusion/PAPER_PiD.md) | arXiv 2026 | [arxiv](https://arxiv.org/abs/2605.23902) | [github](https://github.com/nv-tlabs/PiD) | 2026-06-01 |
 | 15 | [Lumina-Image 2.0: A Unified and Efficient Image Generative Model](Diffusion/PAPER_Lumina-Image-2.0.md) | arXiv 2025 | [arxiv](https://arxiv.org/abs/2503.21758) | [github](https://github.com/Alpha-VLLM/Lumina-Image-2.0) | 2026-05-29 |
 | 14 | [SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer](Diffusion/PAPER_SANA-1.5.md) | arXiv 2025 | [arxiv](https://arxiv.org/abs/2501.18427) | [github](https://github.com/NVlabs/Sana) | 2026-05-29 |
 | 13 | [LongCat-Image: 6B Bilingual Efficient Image Generation Foundation Model](Diffusion/PAPER_LongCat-Image.md) | arXiv 2025 | [arxiv](https://arxiv.org/abs/2512.07584) | [github](https://github.com/meituan-longcat/LongCat-Image) | 2026-05-28 |
